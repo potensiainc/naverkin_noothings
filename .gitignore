@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+browser-profile/
+state/answered_urls.txt
+state/answer_log.csv
+artifacts/
+.playwright-mcp/
+*.js.map

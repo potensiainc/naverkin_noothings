@@ -1,0 +1,26 @@
+{
+  "name": "nothingz-kin",
+  "version": "1.0.0",
+  "description": "NOOTHINGS × NAVER 지식iN Traffic Automation MVP",
+  "main": "dist/run.js",
+  "scripts": {
+    "build": "tsc",
+    "run": "ts-node src/run.ts",
+    "auth:naver": "ts-node src/auth-naver.ts",
+    "get-articles": "ts-node src/get-articles.ts",
+    "test": "ts-node src/tests/run-tests.ts",
+    "phase1": "ts-node src/run-phase.ts 1",
+    "phase2": "ts-node src/run-phase.ts 2",
+    "phase3": "ts-node src/run-phase.ts 3"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-html-parser": "^6.1.13",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}

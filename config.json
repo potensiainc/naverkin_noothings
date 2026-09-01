@@ -1,0 +1,11 @@
+{
+  "site": "https://noothings.kr",
+  "timezone": "Asia/Seoul",
+  "queriesPerArticle": 8,
+  "resultsPerQuery": 12,
+  "maxAnswersPerArticle": 5,
+  "submitRetry": 1,
+  "navigationRetry": 1,
+  "autoSubmit": true,
+  "kinBaseUrl": "https://kin.naver.com/"
+}
