@@ -56,32 +56,37 @@ function buildSearchUrl(query: string, sort: 'date' | 'answer_asc', page: number
 async function extractSearchItems(page: Page): Promise<SearchResult[]> {
   return page.evaluate(() => {
     const results: { questionUrl: string; title: string; answerCount: number }[] = [];
-    // Each result is a <li> inside the search results <ul>
-    const listItems = document.querySelectorAll('.lst_notice_type dt a, .srch_list dt a');
+    const seen = new Set<string>();
 
-    // Fallback: find all links pointing to /qna/detail.naver inside list items
-    const allListItems = Array.from(document.querySelectorAll('li'));
-    for (const li of allListItems) {
-      const titleLink = li.querySelector('dt a[href*="/qna/detail.naver"]') as HTMLAnchorElement | null;
+    // KIN search results: each <li> contains one question link with docId
+    const allLi = Array.from(document.querySelectorAll('li'));
+    for (const li of allLi) {
+      // Find a link that goes to a KIN question (contains docId)
+      const links = Array.from(li.querySelectorAll('a[href*="docId="]')) as HTMLAnchorElement[];
+      if (links.length === 0) continue;
+
+      // Pick the first link with meaningful text (the title link)
+      const titleLink = links.find(a => a.textContent?.trim().length > 5);
       if (!titleLink) continue;
 
       const href = titleLink.href;
+      const docIdMatch = href.match(/docId=(\d+)/);
+      if (!docIdMatch) continue;
+      const docId = docIdMatch[1];
+      if (seen.has(docId)) continue;
+      seen.add(docId);
+
       const title = titleLink.textContent?.trim() ?? '';
+      // Build clean URL with docId only
+      const cleanUrl = `https://kin.naver.com/qna/detail.naver?docId=${docId}`;
 
-      // Extract answer count from definition text
+      // Extract answer count from sibling text
       let answerCount = 0;
-      const defs = Array.from(li.querySelectorAll('dd'));
-      for (const dd of defs) {
-        const match = dd.textContent?.match(/답변수\s*(\d+)/);
-        if (match) {
-          answerCount = parseInt(match[1], 10);
-          break;
-        }
-      }
+      const ddText = li.textContent ?? '';
+      const countMatch = ddText.match(/답변\s*(\d+)/);
+      if (countMatch) answerCount = parseInt(countMatch[1], 10);
 
-      if (href && title) {
-        results.push({ questionUrl: href, title, answerCount });
-      }
+      results.push({ questionUrl: cleanUrl, title, answerCount });
     }
 
     return results;

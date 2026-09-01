@@ -6,18 +6,22 @@ import { DRY_RUN } from './config';
 export type EditorState =
   | 'EMPTY'
   | 'TEXT_INSERTED'
-  | 'URL_PASTED'
   | 'OG_RENDERED'
   | 'RAW_URL_REMOVED'
   | 'CARD_CENTERED'
-  | 'READY_TO_SUBMIT'
   | 'SUBMITTED';
 
 export interface EditorResult {
   success: boolean;
   state: EditorState;
+  answerNo?: number;
   error?: string;
 }
+
+// SmartEditor selector for user-created OG link card
+const OG_SEL = '.se-canvas .se-component.se-oglink:not(.__se-component)';
+// SmartEditor selector for all user-created components
+const COMP_SEL = '.se-canvas .se-component:not(.__se-component)';
 
 export async function postAnswer(
   page: Page,
@@ -25,355 +29,219 @@ export async function postAnswer(
   answerText: string,
   articleUrl: string
 ): Promise<EditorResult> {
-  // Navigate to question page
+  // 1. Navigate to question page
   try {
     await page.goto(questionUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
   } catch (e) {
     return { success: false, state: 'EMPTY', error: `Navigation failed: ${e}` };
   }
 
-  // Click 답변 button to open editor
-  try {
-    await page.click('button:has-text("답변")', { timeout: 5000 });
-    await page.waitForTimeout(1000);
-  } catch (e) {
-    await saveFailureArtifact(page, questionUrl, 'CLICK_ANSWER_BTN');
-    return { success: false, state: 'EMPTY', error: `Cannot click 답변 button: ${e}` };
+  // 2. Check answer button exists
+  const canAnswer = await page.evaluate(() =>
+    !!document.querySelector('.endAnswerRegisterButton._answerWriteButton')
+  );
+  if (!canAnswer) {
+    return { success: false, state: 'EMPTY', error: 'No answer button' };
   }
 
-  // Find the editor contenteditable area
-  const editorSelector = '[contenteditable="true"]';
-  try {
-    await page.waitForSelector(editorSelector, { timeout: 8000 });
-  } catch (e) {
-    await saveFailureArtifact(page, questionUrl, 'EDITOR_NOT_FOUND');
-    return { success: false, state: 'EMPTY', error: `Editor not found: ${e}` };
+  // 3. Click answer button — catch dialog (e.g. "답변이 허용되지 않는 디렉토리")
+  let dialogMsg: string | null = null;
+  page.once('dialog', async (d) => {
+    dialogMsg = d.message();
+    await d.accept();
+  });
+
+  await page.evaluate(() => {
+    (document.querySelector('.endAnswerRegisterButton._answerWriteButton') as HTMLElement)?.click();
+  });
+  await page.waitForTimeout(2500);
+
+  if (dialogMsg) {
+    return { success: false, state: 'EMPTY', error: `Dialog: ${dialogMsg}` };
   }
 
-  // STEP 1: Insert answer text
-  try {
-    const editor = page.locator(editorSelector).first();
-    await editor.click();
-    await editor.fill(answerText);
-    await page.waitForTimeout(500);
-  } catch (e) {
-    await saveFailureArtifact(page, questionUrl, 'TEXT_INSERT_FAILED');
-    return { success: false, state: 'EMPTY', error: `Text insert failed: ${e}` };
+  // 4. Scroll SE canvas into viewport
+  await page.evaluate(() => {
+    document.querySelector('.se-canvas')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
+  await page.waitForTimeout(700);
+
+  const canvasRect = await page.evaluate(() => {
+    const c = document.querySelector('.se-canvas');
+    const r = c?.getBoundingClientRect();
+    return r ? { top: r.top, left: r.left, height: r.height } : null;
+  });
+  if (!canvasRect) {
+    return { success: false, state: 'EMPTY', error: 'SE canvas not found' };
   }
 
-  let state: EditorState = 'TEXT_INSERTED';
+  // 5. Click lower portion of canvas (below policy notice) to focus editor
+  await page.mouse.click(canvasRect.left + 100, canvasRect.top + canvasRect.height * 0.6);
+  await page.waitForTimeout(300);
 
-  // STEP 2: Paste article URL via clipboard
-  // Move to end of editor and add newline before URL
-  try {
-    const editor = page.locator(editorSelector).first();
-    await editor.click();
-    await page.keyboard.press('End');
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(300);
+  // 6. Type answer text (keyboard.type is the only reliable method for SmartEditor)
+  await page.keyboard.type(answerText, { delay: 20 });
+  await page.waitForTimeout(400);
 
-    // Paste URL by typing (clipboard API may not be available in headful context)
-    await page.keyboard.type(articleUrl, { delay: 10 });
-    await page.waitForTimeout(500);
-  } catch (e) {
-    await saveFailureArtifact(page, questionUrl, 'URL_PASTE_FAILED');
-    return { success: false, state, error: `URL paste failed: ${e}` };
+  // Verify text registered in SE component model
+  const textLen = await page.evaluate((sel: string) => {
+    const comps = Array.from(document.querySelectorAll(sel));
+    return comps
+      .filter(c => !c.classList.contains('se-oglink'))
+      .map(c => (c as HTMLElement).innerText.trim())
+      .join('').length;
+  }, COMP_SEL);
+
+  if (textLen < 50) {
+    await saveArtifact(page, questionUrl, 'TEXT_INSERT_FAILED');
+    return { success: false, state: 'EMPTY', error: `Text too short: ${textLen}` };
   }
 
-  state = 'URL_PASTED';
-
-  // Press Enter to trigger OG card generation
+  // 7. Press Enter then type URL to trigger OG card
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(200);
+  await page.keyboard.type(articleUrl, { delay: 25 });
+  await page.waitForTimeout(400);
   await page.keyboard.press('Enter');
 
-  // STEP 3: Wait for OG card
-  const ogRendered = await waitForOGCard(page, articleUrl);
-  if (!ogRendered) {
-    // Retry once
-    await page.keyboard.press('Control+z'); // undo
-    await page.waitForTimeout(300);
-    await page.keyboard.type(articleUrl, { delay: 10 });
-    await page.waitForTimeout(300);
-    await page.keyboard.press('Enter');
-
-    const ogRetry = await waitForOGCard(page, articleUrl);
-    if (!ogRetry) {
-      await saveFailureArtifact(page, questionUrl, 'OG_PREVIEW_FAILED');
-      return { success: false, state: 'URL_PASTED', error: 'OG card did not render after retry' };
-    }
-  }
-
-  state = 'OG_RENDERED';
-
-  // STEP 4: Remove raw URL text from editor visible content
-  const urlRemoved = await removeRawUrl(page, articleUrl);
-  if (!urlRemoved) {
-    // Retry once
-    const urlRemovedRetry = await removeRawUrl(page, articleUrl);
-    if (!urlRemovedRetry) {
-      await saveFailureArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
-      return { success: false, state: 'OG_RENDERED', error: 'Could not remove raw URL text' };
-    }
-  }
-
-  // Verify OG card still exists after URL removal
-  const ogStillExists = await checkOGCardExists(page, articleUrl);
-  if (!ogStillExists) {
-    await saveFailureArtifact(page, questionUrl, 'OG_DISAPPEARED_AFTER_URL_REMOVAL');
-    return { success: false, state: 'OG_RENDERED', error: 'OG card disappeared after URL removal' };
-  }
-
-  state = 'RAW_URL_REMOVED';
-
-  // STEP 5: Center align OG card
-  const centered = await centerAlignOGCard(page);
-  if (!centered) {
-    // Retry once
-    const centeredRetry = await centerAlignOGCard(page);
-    if (!centeredRetry) {
-      await saveFailureArtifact(page, questionUrl, 'CENTER_ALIGN_FAILED');
-      return { success: false, state: 'RAW_URL_REMOVED', error: 'OG card center align failed' };
-    }
-  }
-
-  state = 'CARD_CENTERED';
-
-  // STEP 6: Final gate check
-  const gatePass = await finalGateCheck(page, articleUrl);
-  if (!gatePass.pass) {
-    await saveFailureArtifact(page, questionUrl, 'FINAL_GATE_FAILED');
-    return { success: false, state: 'CARD_CENTERED', error: `Final gate failed: ${gatePass.reason}` };
-  }
-
-  state = 'READY_TO_SUBMIT';
-
-  // STEP 7: Submit
-  if (DRY_RUN) {
-    console.log('[DRYRUN] Skipping actual submission');
-    return { success: true, state: 'READY_TO_SUBMIT' };
-  }
-
-  const submitted = await submitAnswer(page);
-  if (!submitted) {
-    // Retry once
-    const submittedRetry = await submitAnswer(page);
-    if (!submittedRetry) {
-      await saveFailureArtifact(page, questionUrl, 'SUBMIT_FAILED');
-      return { success: false, state: 'READY_TO_SUBMIT', error: 'Submit failed after retry' };
-    }
-  }
-
-  state = 'SUBMITTED';
-
-  // STEP 8: Verify success
-  const verified = await verifySubmitSuccess(page, answerText);
-  if (!verified) {
-    await saveFailureArtifact(page, questionUrl, 'SUBMIT_VERIFY_FAILED');
-    return { success: false, state: 'SUBMITTED', error: 'Could not verify submission success' };
-  }
-
-  return { success: true, state: 'SUBMITTED' };
-}
-
-async function waitForOGCard(page: Page, articleUrl: string): Promise<boolean> {
-  const domain = new URL(articleUrl).hostname;
-  try {
-    // Poll for OG card up to 10s
-    await page.waitForFunction(
-      (d: string) => {
-        const cards = document.querySelectorAll(
-          `a[href*="${d}"], [class*="og"], [class*="card"], [class*="preview"]`
-        );
-        return cards.length > 0;
-      },
-      domain,
-      { timeout: 10000 }
+  // 8. Wait for OG card (poll up to 8s)
+  let ogReady = false;
+  for (let i = 0; i < 8; i++) {
+    await page.waitForTimeout(1000);
+    ogReady = await page.evaluate(
+      (sel: string) => !!document.querySelector(sel),
+      OG_SEL
     );
-    return true;
-  } catch {
-    return false;
+    if (ogReady) break;
   }
-}
-
-async function checkOGCardExists(page: Page, articleUrl: string): Promise<boolean> {
-  const domain = new URL(articleUrl).hostname;
-  return page.evaluate((domain: string) => {
-    const cards = document.querySelectorAll(
-      'a[href*="' + domain + '"], [class*="og"], [class*="card"], [class*="preview"]'
-    );
-    return cards.length > 0;
-  }, domain);
-}
-
-async function removeRawUrl(page: Page, articleUrl: string): Promise<boolean> {
-  // Find text nodes in the editor that contain the raw URL and remove them
-  const removed = await page.evaluate((url: string) => {
-    const editor = document.querySelector('[contenteditable="true"]');
-    if (!editor) return false;
-
-    let found = false;
-    // Walk text nodes
-    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
-    const toRemove: Node[] = [];
-    let node: Text | null;
-    while ((node = walker.nextNode() as Text | null)) {
-      if (node.nodeValue && node.nodeValue.includes(url)) {
-        toRemove.push(node);
-        found = true;
-      }
-    }
-    for (const n of toRemove) {
-      const newText = n.nodeValue?.replace(url, '').replace(/^\s*\n?\s*/, '') ?? '';
-      if (newText.trim()) {
-        n.nodeValue = newText;
-      } else {
-        n.parentNode?.removeChild(n);
-      }
-    }
-    return found;
-  }, articleUrl);
-
-  if (removed) {
-    await page.waitForTimeout(300);
-    // Verify no raw URL visible
-    const stillVisible = await page.evaluate((url: string) => {
-      const editor = document.querySelector('[contenteditable="true"]');
-      return editor?.textContent?.includes(url) ?? false;
-    }, articleUrl);
-    return !stillVisible;
+  if (!ogReady) {
+    await saveArtifact(page, questionUrl, 'OG_NOT_RENDERED');
+    return { success: false, state: 'TEXT_INSERTED', error: 'OG card did not render' };
   }
 
-  return false;
-}
+  // 9. Delete raw URL — it is appended to the last <p> of the last text component
+  //    Strategy: click last p, press End, Backspace × url.length
+  const urlLen = articleUrl.length;
 
-async function centerAlignOGCard(page: Page): Promise<boolean> {
-  try {
-    // Find the OG card block and select it, then apply center alignment
-    // Naver editor typically has toolbar buttons for alignment
-    // Try to find and click the OG card, then use the center alignment button
-    const ogCardEl = page.locator('[class*="og"], [class*="card-link"], [class*="preview"]').first();
-    const exists = await ogCardEl.count();
-    if (!exists) return true; // Nothing to center, consider OK
+  // Scroll last text comp into view
+  await page.evaluate((sel: string) => {
+    const comps = Array.from(document.querySelectorAll(sel));
+    const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+    textComps[textComps.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, COMP_SEL);
+  await page.waitForTimeout(500);
 
-    await ogCardEl.click({ timeout: 3000 });
-    await page.waitForTimeout(200);
+  const lastPPos = await page.evaluate((sel: string) => {
+    const comps = Array.from(document.querySelectorAll(sel));
+    const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+    const lastComp = textComps[textComps.length - 1];
+    if (!lastComp) return null;
+    const paras = Array.from(lastComp.querySelectorAll('p'));
+    const lastP = paras[paras.length - 1];
+    if (!lastP) return null;
+    const r = lastP.getBoundingClientRect();
+    return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
+  }, COMP_SEL);
 
-    // Find center alignment button in toolbar
-    // Common accessible names: "가운데", "center", "align-center"
-    const centerBtn = page.locator(
-      'button[title*="중앙"], button[title*="가운데"], button[aria-label*="중앙"], button[aria-label*="가운데"], button[title*="center" i], button[aria-label*="center" i]'
-    ).first();
-
-    const btnCount = await centerBtn.count();
-    if (btnCount > 0) {
-      await centerBtn.click({ timeout: 3000 });
-      await page.waitForTimeout(300);
-    }
-
-    // Verify center alignment by checking if the card appears to be centered
-    return true;
-  } catch {
-    return false;
+  if (!lastPPos) {
+    await saveArtifact(page, questionUrl, 'LAST_P_NOT_FOUND');
+    return { success: false, state: 'OG_RENDERED', error: 'Last p not found' };
   }
-}
 
-interface GateCheckResult {
-  pass: boolean;
-  reason?: string;
-}
+  await page.mouse.click(lastPPos.x, lastPPos.y);
+  await page.waitForTimeout(200);
+  await page.keyboard.press('End');
+  await page.waitForTimeout(100);
 
-async function finalGateCheck(page: Page, articleUrl: string): Promise<GateCheckResult> {
-  const domain = new URL(articleUrl).hostname;
+  for (let i = 0; i < urlLen; i++) {
+    await page.keyboard.press('Backspace');
+  }
+  await page.waitForTimeout(300);
 
-  const result = await page.evaluate(
-    ({ url, domain }: { url: string; domain: string }) => {
-      const editor = document.querySelector('[contenteditable="true"]');
-      if (!editor) return { pass: false, reason: 'Editor not found' };
-
-      const text = editor.textContent ?? '';
-      if (text.trim().length < 50) {
-        return { pass: false, reason: 'Answer text too short' };
-      }
-
-      // Check no raw URL visible
-      if (text.includes(url)) {
-        return { pass: false, reason: 'Raw URL still visible in editor' };
-      }
-
-      // Check OG card exists
-      const card = document.querySelector(`a[href*="${domain}"], [class*="og"], [class*="card"], [class*="preview"]`);
-      if (!card) {
-        return { pass: false, reason: 'OG card not found' };
-      }
-
-      return { pass: true };
+  // Verify raw URL gone from text components
+  const rawUrlPresent = await page.evaluate(
+    ({ sel, url }: { sel: string; url: string }) => {
+      const comps = Array.from(document.querySelectorAll(sel));
+      const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+      return textComps.map(c => (c as HTMLElement).innerText.trim()).join('').includes(url);
     },
-    { url: articleUrl, domain }
+    { sel: COMP_SEL, url: articleUrl }
   );
 
-  return result;
+  if (rawUrlPresent) {
+    await saveArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
+    return { success: false, state: 'OG_RENDERED', error: 'Raw URL still present' };
+  }
+
+  // 10. Click OG card center to select/center-align it
+  await page.evaluate((sel: string) => {
+    document.querySelector(sel)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, OG_SEL);
+  await page.waitForTimeout(500);
+
+  const ogCenter = await page.evaluate((sel: string) => {
+    const og = document.querySelector(sel);
+    const r = og?.getBoundingClientRect();
+    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
+  }, OG_SEL);
+
+  if (ogCenter) {
+    await page.mouse.click(ogCenter.x, ogCenter.y);
+    await page.waitForTimeout(500);
+  }
+
+  // 11. Final gate check
+  const gate = await page.evaluate(
+    ({ compSel, url }: { compSel: string; url: string }) => {
+      const comps = Array.from(document.querySelectorAll(compSel));
+      const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+      const totalText = textComps.map(c => (c as HTMLElement).innerText.trim()).join('');
+      const hasOg = comps.some(c => c.classList.contains('se-oglink'));
+      const rawUrl = totalText.includes(url);
+      return { textLen: totalText.length, hasOg, rawUrl };
+    },
+    { compSel: COMP_SEL, url: articleUrl }
+  );
+
+  if (gate.textLen < 50 || !gate.hasOg || gate.rawUrl) {
+    await saveArtifact(page, questionUrl, 'GATE_FAILED');
+    return {
+      success: false,
+      state: 'CARD_CENTERED',
+      error: `Gate failed: textLen=${gate.textLen} hasOg=${gate.hasOg} rawUrl=${gate.rawUrl}`,
+    };
+  }
+
+  if (DRY_RUN) {
+    console.log('[DRYRUN] Gate passed — skipping submit');
+    return { success: true, state: 'CARD_CENTERED' };
+  }
+
+  // 12. Submit
+  await page.evaluate(() => {
+    (document.querySelector('.endAnswerButton._answerRegisterButton') as HTMLElement)?.click();
+  });
+  await page.waitForTimeout(3000);
+
+  const resultUrl = page.url();
+  const answerNoMatch = resultUrl.match(/answerNo=(\d+)/);
+  if (!answerNoMatch) {
+    await saveArtifact(page, questionUrl, 'SUBMIT_NO_ANSWER_NO');
+    return { success: false, state: 'SUBMITTED', error: `No answerNo in URL: ${resultUrl}` };
+  }
+
+  return { success: true, state: 'SUBMITTED', answerNo: parseInt(answerNoMatch[1]) };
 }
 
-async function submitAnswer(page: Page): Promise<boolean> {
+async function saveArtifact(page: Page, url: string, stage: string) {
   try {
-    // Find the submit button - common Korean text: "등록", "답변 등록", "작성 완료"
-    const submitBtn = page.locator(
-      'button:has-text("등록"), button:has-text("답변등록"), input[type="submit"][value*="등록"]'
-    ).first();
-
-    const count = await submitBtn.count();
-    if (!count) return false;
-
-    await submitBtn.click({ timeout: 5000 });
-    await page.waitForTimeout(2000);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function verifySubmitSuccess(page: Page, answerText: string): Promise<boolean> {
-  // Wait for page to settle after submission
-  try {
-    await page.waitForTimeout(2000);
-
-    // Verify by checking:
-    // 1. The editor is gone (submission complete)
-    // 2. OR the answer text appears in the answer list
-    // 3. OR a success message appeared
-
-    const verified = await page.evaluate((text: string) => {
-      // Check if editor is still visible (if not, submission likely succeeded)
-      const editor = document.querySelector('[contenteditable="true"]');
-      if (!editor) return true;
-
-      // Check if answer text appears in the answer list
-      const firstChunk = text.slice(0, 30);
-      const answers = Array.from(document.querySelectorAll('[id^="answer"]'));
-      for (const ans of answers) {
-        if (ans.textContent?.includes(firstChunk)) return true;
-      }
-
-      return false;
-    }, answerText);
-
-    return verified;
-  } catch {
-    return false;
-  }
-}
-
-async function saveFailureArtifact(page: Page, questionUrl: string, stage: string) {
-  try {
-    const artifactsDir = path.resolve(__dirname, '../artifacts/failures');
-    if (!fs.existsSync(artifactsDir)) fs.mkdirSync(artifactsDir, { recursive: true });
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const screenshotPath = path.join(artifactsDir, `${timestamp}-${stage}.png`);
-    const logPath = path.join(artifactsDir, `${timestamp}-${stage}.txt`);
-
-    await page.screenshot({ path: screenshotPath, fullPage: false });
-    fs.writeFileSync(logPath, `Stage: ${stage}\nURL: ${questionUrl}\nPage: ${page.url()}\nTimestamp: ${timestamp}`);
-  } catch {
-    // Best effort
-  }
+    const dir = path.resolve(__dirname, '../artifacts/failures');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    await page.screenshot({ path: path.join(dir, `${ts}-${stage}.png`), fullPage: false });
+    fs.writeFileSync(
+      path.join(dir, `${ts}-${stage}.txt`),
+      `Stage: ${stage}\nURL: ${url}\nResultURL: ${page.url()}`
+    );
+  } catch { /* best effort */ }
 }

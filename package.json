@@ -11,7 +11,8 @@
     "test": "ts-node src/tests/run-tests.ts",
     "phase1": "ts-node src/run-phase.ts 1",
     "phase2": "ts-node src/run-phase.ts 2",
-    "phase3": "ts-node src/run-phase.ts 3"
+    "phase3": "ts-node src/run-phase.ts 3",
+    "daily": "ts-node src/daily.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
