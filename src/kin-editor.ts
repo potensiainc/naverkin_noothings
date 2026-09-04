@@ -72,6 +72,7 @@ export async function postAnswer(
     return r ? { top: r.top, left: r.left, height: r.height } : null;
   });
   if (!canvasRect) {
+    await saveArtifact(page, questionUrl, 'SE_CANVAS_NOT_FOUND');
     return { success: false, state: 'EMPTY', error: 'SE canvas not found' };
   }
 

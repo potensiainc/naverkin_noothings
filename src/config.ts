@@ -2,9 +2,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
 
-// Load credentials from nodong_noothings/.env.local (parent of nothingz-kin/)
-dotenv.config({ path: path.resolve(__dirname, '../../.env.local') });
-// Fallback to nothingz-kin/.env
+// Load credentials from project root .env.local
+dotenv.config({ path: path.resolve(__dirname, '../.env.local') });
+// Fallback to .env
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 interface Config {

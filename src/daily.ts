@@ -40,6 +40,7 @@ async function main() {
 
   // 2. 브라우저 시작
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    channel: 'chrome',
     headless: false,
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',
@@ -77,11 +78,10 @@ async function main() {
       for (const result of results) {
         if (answeredCount >= config.maxAnswersPerArticle) break;
 
-        // docId만 추출해 정규화된 URL 생성
-        const docIdMatch = result.questionUrl.match(/docId=(\d+)/);
-        if (!docIdMatch) continue;
-        const docId = docIdMatch[1];
-        const cleanUrl = `https://kin.naver.com/qna/detail.naver?docId=${docId}`;
+        // dirId가 없으면 detail.naver가 "유효하지 않은 요청"으로 거부하므로
+        // 검색 결과가 만든 완전한 URL(dirId 포함)을 그대로 사용한다.
+        const docId = result.docId;
+        const cleanUrl = result.questionUrl;
         const key = normalizeKinUrl(cleanUrl);
 
         if (answeredUrls.has(key)) {

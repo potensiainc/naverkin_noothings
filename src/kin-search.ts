@@ -4,6 +4,8 @@ import { QuestionContent } from './question-matcher';
 
 export interface SearchResult {
   questionUrl: string;
+  docId: string;
+  dirId: string;
   title: string;
   answerCount: number;
 }
@@ -55,10 +57,11 @@ function buildSearchUrl(query: string, sort: 'date' | 'answer_asc', page: number
 
 async function extractSearchItems(page: Page): Promise<SearchResult[]> {
   return page.evaluate(() => {
-    const results: { questionUrl: string; title: string; answerCount: number }[] = [];
+    const results: { questionUrl: string; docId: string; dirId: string; title: string; answerCount: number }[] = [];
     const seen = new Set<string>();
 
-    // KIN search results: each <li> contains one question link with docId
+    // KIN search results: each <li> contains one question link with docId + dirId.
+    // dirId is required — detail.naver rejects docId-only URLs as invalid requests.
     const allLi = Array.from(document.querySelectorAll('li'));
     for (const li of allLi) {
       // Find a link that goes to a KIN question (contains docId)
@@ -71,14 +74,15 @@ async function extractSearchItems(page: Page): Promise<SearchResult[]> {
 
       const href = titleLink.href;
       const docIdMatch = href.match(/docId=(\d+)/);
-      if (!docIdMatch) continue;
+      const dirIdMatch = href.match(/dirId=(\d+)/);
+      if (!docIdMatch || !dirIdMatch) continue;
       const docId = docIdMatch[1];
+      const dirId = dirIdMatch[1];
       if (seen.has(docId)) continue;
       seen.add(docId);
 
       const title = titleLink.textContent?.trim() ?? '';
-      // Build clean URL with docId only
-      const cleanUrl = `https://kin.naver.com/qna/detail.naver?docId=${docId}`;
+      const cleanUrl = `https://kin.naver.com/qna/detail.naver?dirId=${dirId}&docId=${docId}`;
 
       // Extract answer count from sibling text
       let answerCount = 0;
@@ -86,7 +90,7 @@ async function extractSearchItems(page: Page): Promise<SearchResult[]> {
       const countMatch = ddText.match(/답변\s*(\d+)/);
       if (countMatch) answerCount = parseInt(countMatch[1], 10);
 
-      results.push({ questionUrl: cleanUrl, title, answerCount });
+      results.push({ questionUrl: cleanUrl, docId, dirId, title, answerCount });
     }
 
     return results;
@@ -149,20 +153,18 @@ export async function readQuestion(page: Page, url: string): Promise<QuestionCon
       }
     }
 
-    if (!rawTitle) return null;
+    if (!rawTitle || rawTitle === '페이지 없음') return null;
     return { title: rawTitle, body };
   });
 }
 
-// Navigates to KIN and checks session health from KIN DOM.
-// Returns true when session is valid (no login link, on KIN domain).
+// Navigates to KIN and checks session health via the NID_AUT auth cookie.
+// The "로그인" link is present in KIN's header DOM regardless of login state,
+// so it cannot be used as a login indicator — the auth cookie is authoritative.
 export async function checkKinSession(page: Page): Promise<boolean> {
   await page.goto(config.kinBaseUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-  return page.evaluate(() => {
-    const loginLink = document.querySelector('a[href*="nidlogin.login"]');
-    if (loginLink) return false;
-    // Confirm we are actually on KIN (not an error page)
-    const onKin = window.location.hostname.includes('kin.naver.com');
-    return onKin;
-  });
+  const cookies = await page.context().cookies('https://www.naver.com');
+  const hasAuthCookie = cookies.some(c => c.name === 'NID_AUT' || c.name === 'NID_SES');
+  const onKin = page.url().includes('kin.naver.com');
+  return hasAuthCookie && onKin;
 }
