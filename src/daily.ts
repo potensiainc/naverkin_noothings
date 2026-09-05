@@ -6,18 +6,14 @@ import { searchKin, readQuestion, checkKinSession } from './kin-search';
 import { generateKinAnswer } from './answer-writer';
 import { postAnswer } from './kin-editor';
 import { normalizeKinUrl, loadAnsweredUrls, appendAnsweredUrl, appendAnswerLog } from './state';
+import { extractSearchQueries, matchArticleToQuestion } from './keyword-matcher';
 
 const PROFILE_DIR = path.resolve(__dirname, '../browser-profile');
 
-function buildQueries(article: Article): string[] {
-  const title = article.title;
-  const tokens = title.split(/[\s·\-·]+/).filter(w => w.length > 1);
-  const queries: string[] = [title];
-  for (let i = 0; i < tokens.length - 1 && queries.length < config.queriesPerArticle; i++) {
-    queries.push(`${tokens[i]} ${tokens[i + 1]}`);
-  }
-  return queries.slice(0, config.queriesPerArticle);
-}
+// Only these match types are answerable — ADJACENT_ANSWERABLE and UNRELATED
+// are skipped. This pipeline runs unattended, so a strict gate matters more
+// than answer volume: a wrong-article answer is worse than no answer.
+const ANSWERABLE_MATCH_TYPES = new Set(['DIRECT', 'SAME_PROBLEM']);
 
 async function main() {
   const startedAt = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
@@ -62,7 +58,15 @@ async function main() {
   for (const article of articles) {
     console.log(`\n[ARTICLE] [${article.id}] ${article.title}`);
     let answeredCount = 0;
-    const queries = buildQueries(article);
+
+    let queries: string[];
+    try {
+      queries = await extractSearchQueries(article, config.queriesPerArticle);
+      console.log(`  키워드: ${queries.join(', ')}`);
+    } catch (e) {
+      console.error(`  키워드 도출 실패, 글 스킵:`, e);
+      continue;
+    }
 
     for (const query of queries) {
       if (answeredCount >= config.maxAnswersPerArticle) break;
@@ -96,7 +100,22 @@ async function main() {
           continue;
         }
 
-        // claude CLI로 답변 생성
+        // 글-질문 적합성 판단 (DIRECT/SAME_PROBLEM만 답변 진행)
+        let matchType: string;
+        try {
+          const match = await matchArticleToQuestion(article, question);
+          matchType = match.matchType;
+          if (!ANSWERABLE_MATCH_TYPES.has(matchType)) {
+            console.log(`    SKIP (${matchType}): ${question.title.slice(0, 40)} — ${match.reason}`);
+            continue;
+          }
+          console.log(`    매칭: ${matchType} — ${match.reason}`);
+        } catch (e) {
+          console.error(`    매칭 판단 실패, 스킵: docId=${docId}`, e);
+          continue;
+        }
+
+        // codex CLI로 답변 생성
         let answerText: string;
         try {
           console.log(`    답변 생성 중: ${question.title.slice(0, 40)}`);
@@ -122,7 +141,7 @@ async function main() {
           articleUrl: article.permalink,
           questionUrl: cleanUrl,
           queryUsed: query,
-          matchType: 'AUTO',
+          matchType,
           status: (editorResult.success ? 'SUCCESS' : 'FAILED') as 'SUCCESS' | 'FAILED',
           errorMessage: editorResult.error,
         };

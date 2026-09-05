@@ -16,6 +16,12 @@ export async function generateKinAnswer(params: AnswerParams): Promise<string> {
   return runCodex(prompt);
 }
 
+// Shared with keyword-matcher.ts — one codex CLI invocation path for the
+// whole pipeline (answer writing, keyword extraction, question matching).
+export function runCodexPrompt(prompt: string): Promise<string> {
+  return runCodex(prompt);
+}
+
 function buildPrompt(p: AnswerParams): string {
   return `당신은 네이버 지식iN 답변 작성 도우미입니다.
 

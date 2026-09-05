@@ -5,10 +5,8 @@ import { DRY_RUN } from './config';
 
 export type EditorState =
   | 'EMPTY'
-  | 'TEXT_INSERTED'
   | 'OG_RENDERED'
-  | 'RAW_URL_REMOVED'
-  | 'CARD_CENTERED'
+  | 'ANSWER_TEXT_INSERTED'
   | 'SUBMITTED';
 
 export interface EditorResult {
@@ -99,32 +97,26 @@ export async function postAnswer(
   await page.mouse.click(canvasRect.left + 100, canvasRect.top + canvasRect.height * 0.6);
   await page.waitForTimeout(300);
 
-  // 6. Type answer text (keyboard.type is the only reliable method for SmartEditor)
-  await page.keyboard.type(answerText, { delay: 20 });
-  await page.waitForTimeout(400);
-
-  // Verify text registered in SE component model
-  const textLen = await page.evaluate((sel: string) => {
-    const comps = Array.from(document.querySelectorAll(sel));
-    return comps
-      .filter(c => !c.classList.contains('se-oglink'))
-      .map(c => (c as HTMLElement).innerText.trim())
-      .join('').length;
-  }, COMP_SEL);
-
-  if (textLen < 50) {
-    await saveArtifact(page, questionUrl, 'TEXT_INSERT_FAILED');
-    return { success: false, state: 'EMPTY', error: `Text too short: ${textLen}` };
-  }
-
-  // 7. Press Enter then type URL to trigger OG card
-  await page.keyboard.press('Enter');
-  await page.waitForTimeout(200);
+  // 6. Type the article URL FIRST, on its own line, before the answer text.
+  //    This is the opposite of the obvious order, but it is what makes safe
+  //    raw-URL cleanup possible: typed first, the URL becomes its own
+  //    isolated leading component once Naver converts it into an OG card,
+  //    with nothing else sharing that component. Typed after the answer
+  //    text (the original approach), the leftover raw-URL text instead
+  //    lands inside (or right next to) components that also hold the real
+  //    answer or the OG card, and every attempted deletion there — counted
+  //    Backspaces, Home+Shift+End+Delete, repeated Home+Delete — ended up
+  //    either destroying the OG card or leaving a mangled partial-URL
+  //    fragment behind, because Naver auto-links the URL and a single
+  //    Delete/Backspace on that auto-link removes an unpredictable chunk
+  //    rather than the whole link atomically. With the URL isolated in its
+  //    own component, a triple-click cleanly selects that entire paragraph
+  //    and Delete removes it in one shot with no neighboring content at risk.
   await page.keyboard.type(articleUrl, { delay: 25 });
   await page.waitForTimeout(400);
   await page.keyboard.press('Enter');
 
-  // 8. Wait for OG card (poll up to 8s). The card can flicker in and out
+  // 7. Wait for OG card (poll up to 8s). The card can flicker in and out
   //    while Naver fetches the link preview, so a single positive poll isn't
   //    enough — re-check after a settle delay before trusting it.
   let ogReady = false;
@@ -138,7 +130,7 @@ export async function postAnswer(
   }
   if (!ogReady) {
     await saveArtifact(page, questionUrl, 'OG_NOT_RENDERED');
-    return { success: false, state: 'TEXT_INSERTED', error: 'OG card did not render' };
+    return { success: false, state: 'EMPTY', error: 'OG card did not render' };
   }
 
   // Settle check — confirm the card is still there a moment later.
@@ -146,74 +138,52 @@ export async function postAnswer(
   ogReady = await page.evaluate((sel: string) => !!document.querySelector(sel), OG_SEL);
   if (!ogReady) {
     await saveArtifact(page, questionUrl, 'OG_DISAPPEARED_AFTER_SETTLE');
-    return { success: false, state: 'TEXT_INSERTED', error: 'OG card disappeared after settle wait' };
+    return { success: false, state: 'EMPTY', error: 'OG card disappeared after settle wait' };
   }
 
-  // 9. Delete raw URL if SmartEditor left it behind as text.
-  //    SmartEditor normally converts the typed URL into the OG card and
-  //    leaves an empty trailing paragraph — no raw URL text remains. In that
-  //    case this step must be skipped entirely: the last text component is
-  //    empty, so Backspace would run past its start and delete into the
-  //    OG card component before it, destroying the card we just rendered.
-  let rawUrlPresent = await page.evaluate(
-    ({ sel, url }: { sel: string; url: string }) => {
+  // 8. Delete the leading raw-URL paragraph via triple-click (selects the
+  //    whole paragraph as one unit) + Delete, then Backspace once to merge
+  //    away the now-empty line. This never touches the OG card or answer
+  //    text because the URL was typed into its own isolated component.
+  const hasStrayUrlText = () => page.evaluate(
+    (sel: string) => {
       const comps = Array.from(document.querySelectorAll(sel));
       const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-      return textComps.map(c => (c as HTMLElement).innerText.trim()).join('').includes(url);
+      return /https?:\/\//i.test(textComps.map(c => (c as HTMLElement).innerText).join(''));
     },
-    { sel: COMP_SEL, url: articleUrl }
+    COMP_SEL
   );
 
-  if (rawUrlPresent) {
-    // Find the <p> that actually contains the raw URL text. SmartEditor
-    // does NOT always leave it in a trailing empty component — it can sit
-    // at the end of the very text component we typed the answer into,
-    // right after the OG card is inserted as a separate component after it.
-    // Targeting "the last text component" unconditionally used to grab the
-    // wrong (unrelated, already-empty) component and delete into the OG
-    // card by accident. Search every paragraph in every non-OG component
-    // and act on the one whose own text contains the URL.
-    const urlPPos = await page.evaluate(
-      ({ sel, url }: { sel: string; url: string }) => {
-        const comps = Array.from(document.querySelectorAll(sel));
-        const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-        for (const comp of textComps) {
-          const paras = Array.from(comp.querySelectorAll('p'));
-          for (const p of paras) {
-            if (p.textContent?.includes(url)) {
-              p.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              const r = p.getBoundingClientRect();
-              return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
-            }
-          }
-        }
-        return null;
-      },
-      { sel: COMP_SEL, url: articleUrl }
-    );
-    await page.waitForTimeout(500);
+  if (await hasStrayUrlText()) {
+    await page.evaluate((sel: string) => {
+      const comps = Array.from(document.querySelectorAll(sel));
+      const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+      const first = textComps[0];
+      const p = first?.querySelector('p');
+      (p as HTMLElement | null)?.scrollIntoView({ behavior: 'instant', block: 'center' });
+    }, COMP_SEL);
+    await page.waitForTimeout(300);
+
+    const urlPPos = await page.evaluate((sel: string) => {
+      const comps = Array.from(document.querySelectorAll(sel));
+      const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+      const first = textComps[0];
+      const p = first?.querySelector('p');
+      if (!p) return null;
+      const r = (p as HTMLElement).getBoundingClientRect();
+      return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
+    }, COMP_SEL);
 
     if (!urlPPos) {
       await saveArtifact(page, questionUrl, 'LAST_P_NOT_FOUND');
       return { success: false, state: 'OG_RENDERED', error: 'Paragraph containing raw URL not found' };
     }
 
-    await page.mouse.click(urlPPos.x, urlPPos.y);
+    await page.mouse.click(urlPPos.x, urlPPos.y, { clickCount: 3 });
     await page.waitForTimeout(200);
-
-    // Select the whole trailing paragraph (Home, then Shift+End) and delete
-    // it in one shot, instead of counting Backspaces. This paragraph only
-    // ever contains the raw URL we just typed (or is already empty because
-    // SmartEditor converted it into the OG card), so selecting its full
-    // extent and deleting can never reach past its own boundary into the
-    // OG card component before it — unlike a fixed-count Backspace loop,
-    // which doesn't know how many raw characters actually remain and can
-    // run past them and destroy the card.
-    await page.keyboard.press('Home');
-    await page.waitForTimeout(100);
-    await page.keyboard.press('Shift+End');
-    await page.waitForTimeout(100);
     await page.keyboard.press('Delete');
+    await page.waitForTimeout(200);
+    await page.keyboard.press('Backspace');
     await page.waitForTimeout(300);
 
     const ogStillThere = await page.evaluate((sel: string) => !!document.querySelector(sel), OG_SEL);
@@ -222,55 +192,75 @@ export async function postAnswer(
       return { success: false, state: 'OG_RENDERED', error: 'OG card destroyed while removing raw URL text' };
     }
 
-    rawUrlPresent = await page.evaluate(
-      ({ sel, url }: { sel: string; url: string }) => {
-        const comps = Array.from(document.querySelectorAll(sel));
-        const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-        return textComps.map(c => (c as HTMLElement).innerText.trim()).join('').includes(url);
-      },
-      { sel: COMP_SEL, url: articleUrl }
-    );
-
-    if (rawUrlPresent) {
+    if (await hasStrayUrlText()) {
       await saveArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
-      return { success: false, state: 'OG_RENDERED', error: 'Raw URL still present' };
+      return { success: false, state: 'OG_RENDERED', error: 'Raw URL text still present' };
     }
   }
 
+  // 9. Move the caret to the very start of the editor and type the answer
+  //    text there, so it ends up before the OG card in reading order.
+  const canvasPos = await page.evaluate(() => {
+    const c = document.querySelector('.se-canvas');
+    const r = c?.getBoundingClientRect();
+    return r ? { x: r.left + 100, y: r.top + 20 } : null;
+  });
+  if (canvasPos) {
+    await page.mouse.click(canvasPos.x, canvasPos.y);
+    await page.waitForTimeout(200);
+  }
+  await page.keyboard.press('Control+Home');
+  await page.waitForTimeout(100);
+  await page.keyboard.type(answerText, { delay: 20 });
+  await page.waitForTimeout(400);
+
+  const textLen = await page.evaluate((sel: string) => {
+    const comps = Array.from(document.querySelectorAll(sel));
+    return comps
+      .filter(c => !c.classList.contains('se-oglink'))
+      .map(c => (c as HTMLElement).innerText.trim())
+      .join('').length;
+  }, COMP_SEL);
+
+  if (textLen < 50) {
+    await saveArtifact(page, questionUrl, 'TEXT_INSERT_FAILED');
+    return { success: false, state: 'OG_RENDERED', error: `Text too short: ${textLen}` };
+  }
+
   // 10. Scroll OG card into view (no click — clicking it risks landing on its
-  //     hover-revealed delete/edit overlay and destroying the card, which is
-  //     what was happening here before: the card rendered fine but vanished
-  //     right after this click).
+  //     hover-revealed delete/edit overlay and destroying the card).
   await page.evaluate((sel: string) => {
     document.querySelector(sel)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }, OG_SEL);
   await page.waitForTimeout(500);
 
-  // 11. Final gate check
+  // 11. Final gate check. Checks for ANY leftover http(s) text, not just an
+  //     exact match on the original URL string, in case any stray fragment
+  //     survived step 8.
   const gate = await page.evaluate(
-    ({ compSel, url }: { compSel: string; url: string }) => {
+    (compSel: string) => {
       const comps = Array.from(document.querySelectorAll(compSel));
       const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
       const totalText = textComps.map(c => (c as HTMLElement).innerText.trim()).join('');
       const hasOg = comps.some(c => c.classList.contains('se-oglink'));
-      const rawUrl = totalText.includes(url);
+      const rawUrl = /https?:\/\//i.test(totalText);
       return { textLen: totalText.length, hasOg, rawUrl };
     },
-    { compSel: COMP_SEL, url: articleUrl }
+    COMP_SEL
   );
 
   if (gate.textLen < 50 || !gate.hasOg || gate.rawUrl) {
     await saveArtifact(page, questionUrl, 'GATE_FAILED');
     return {
       success: false,
-      state: 'CARD_CENTERED',
+      state: 'ANSWER_TEXT_INSERTED',
       error: `Gate failed: textLen=${gate.textLen} hasOg=${gate.hasOg} rawUrl=${gate.rawUrl}`,
     };
   }
 
   if (DRY_RUN) {
     console.log('[DRYRUN] Gate passed — skipping submit');
-    return { success: true, state: 'CARD_CENTERED' };
+    return { success: true, state: 'ANSWER_TEXT_INSERTED' };
   }
 
   // 12. Submit — real pointer click, same reason as the answer-open button above.
