@@ -34,18 +34,32 @@ export async function postAnswer(
     return { success: false, state: 'EMPTY', error: `Navigation failed: ${e}` };
   }
 
-  // 2. Check answer button exists.
-  //    Naver renders two buttons that open the same editor: a header/inline
-  //    one (.endAnswerButton._answerWriteButton, always in the DOM) and a
-  //    scroll-triggered floating one (.endAnswerRegisterButton._answerWriteButton,
-  //    hidden until the page is scrolled). Prefer whichever is actually visible.
-  const floatingBtn = page.locator('.endAnswerRegisterButton._answerWriteButton').first();
-  const inlineBtn = page.locator('.endAnswerButton._answerWriteButton').first();
-  let answerBtn = floatingBtn;
-  let canAnswer = await floatingBtn.isVisible().catch(() => false);
+  // 2. Find the "답변하기"/"답변" CTA that opens the editor. Naver's class
+  //    names have changed before (endAnswerButton vs endAnswerRegisterButton
+  //    across page layouts) and will likely change again, so class-based
+  //    selectors are tried first as the fast path, then a text/role-based
+  //    fallback searches any <button> whose visible text is exactly "답변"
+  //    or "답변하기" — that survives a class rename since it depends on
+  //    what a human would actually read on the button.
+  const classCandidates = [
+    page.locator('.endAnswerRegisterButton._answerWriteButton').first(),
+    page.locator('.endAnswerButton._answerWriteButton').first(),
+  ];
+  let answerBtn = classCandidates[0];
+  let canAnswer = false;
+  for (const candidate of classCandidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      answerBtn = candidate;
+      canAnswer = true;
+      break;
+    }
+  }
   if (!canAnswer) {
-    canAnswer = await inlineBtn.isVisible().catch(() => false);
-    if (canAnswer) answerBtn = inlineBtn;
+    const textBtn = page.locator('button', { hasText: /^답변(하기)?$/ }).first();
+    if (await textBtn.isVisible().catch(() => false)) {
+      answerBtn = textBtn;
+      canAnswer = true;
+    }
   }
   if (!canAnswer) {
     return { success: false, state: 'EMPTY', error: 'No answer button' };
@@ -263,8 +277,22 @@ export async function postAnswer(
     return { success: true, state: 'ANSWER_TEXT_INSERTED' };
   }
 
-  // 12. Submit — real pointer click, same reason as the answer-open button above.
-  const submitBtn = page.locator('.endAnswerButton._answerRegisterButton').first();
+  // 12. Submit ("등록" button next to "저장") — same class-then-text
+  //     fallback strategy as the answer-open CTA above, for the same reason:
+  //     class names on this page have already changed once and can again.
+  let submitBtn = page.locator('.endAnswerButton._answerRegisterButton').first();
+  let canSubmit = await submitBtn.isVisible().catch(() => false);
+  if (!canSubmit) {
+    const textSubmitBtn = page.locator('button', { hasText: /^등록$/ }).first();
+    if (await textSubmitBtn.isVisible().catch(() => false)) {
+      submitBtn = textSubmitBtn;
+      canSubmit = true;
+    }
+  }
+  if (!canSubmit) {
+    await saveArtifact(page, questionUrl, 'SUBMIT_BUTTON_NOT_FOUND');
+    return { success: false, state: 'ANSWER_TEXT_INSERTED', error: 'No submit ("등록") button found' };
+  }
   await submitBtn.click({ timeout: 5000 }).catch(() => { /* handled by post-click URL check below */ });
   await page.waitForTimeout(3000);
 

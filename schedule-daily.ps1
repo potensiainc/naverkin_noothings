@@ -6,6 +6,10 @@
 # 못 얻어 세션 체크가 매번 실패한다("KIN 세션 만료"). 그래서 Interactive
 # 로그온으로 등록한다 — 그 시각에 PC가 켜져 있고 해당 계정으로 로그인된
 # 상태여야 실행된다 (잠금화면/로그아웃 상태면 스킵됨).
+#
+# 답변 등록 성공마다 42/27/72분을 순환 대기하므로(daily.ts 참고) 글이
+# 여러 개면 실행 시간이 몇 시간에 이를 수 있다. ExecutionTimeLimit을
+# 넉넉히 12시간으로 잡아 그 안에 강제 종료되지 않게 한다.
 
 $taskName = "nothingz-kin-daily"
 $projectDir = "D:\naverkin_noothings"
@@ -18,7 +22,7 @@ $action = New-ScheduledTaskAction `
 $trigger = New-ScheduledTaskTrigger -Daily -At "09:00AM"
 
 $settings = New-ScheduledTaskSettingsSet `
-  -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+  -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
   -StartWhenAvailable
 
 $principal = New-ScheduledTaskPrincipal `

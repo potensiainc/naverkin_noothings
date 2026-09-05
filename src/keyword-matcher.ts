@@ -32,14 +32,7 @@ export async function extractSearchQueries(article: Article, count: number): Pro
   return queries.slice(0, count);
 }
 
-// Judges whether an article can actually answer a specific KIN question.
-// Only DIRECT and SAME_PROBLEM are treated as answerable — this pipeline
-// runs unattended, so a strict gate matters more than answer volume.
-export async function matchArticleToQuestion(
-  article: Article,
-  question: QuestionContent
-): Promise<{ matchType: MatchType; reason: string }> {
-  const prompt = `당신은 네이버 지식iN 질문과 블로그 글의 적합성을 판단하는 전문가입니다.
+const MATCH_PROMPT = (article: Article, question: QuestionContent) => `당신은 네이버 지식iN 질문과 블로그 글의 적합성을 판단하는 전문가입니다.
 
 질문자가 실제로 처한 상황과 겪는 문제를 이해하고, 아래 글이 그 문제를 해결해줄 수 있는지 판단하세요.
 
@@ -62,7 +55,15 @@ export async function matchArticleToQuestion(
 결과를 JSON 객체 하나로만 출력하세요 (설명, 마크다운 없이):
 {"matchType": "DIRECT|SAME_PROBLEM|ADJACENT_ANSWERABLE|UNRELATED", "reason": "한 문장 이유"}`;
 
-  const raw = await runCodexPrompt(prompt);
+const MATCH_RANK: Record<MatchType, number> = {
+  DIRECT: 3,
+  SAME_PROBLEM: 2,
+  ADJACENT_ANSWERABLE: 1,
+  UNRELATED: 0,
+};
+
+async function callMatchOnce(article: Article, question: QuestionContent): Promise<{ matchType: MatchType; reason: string }> {
+  const raw = await runCodexPrompt(MATCH_PROMPT(article, question));
   const parsed = parseJsonObject(raw);
   const matchType = parsed?.matchType as MatchType | undefined;
   const validTypes: MatchType[] = ['DIRECT', 'SAME_PROBLEM', 'ADJACENT_ANSWERABLE', 'UNRELATED'];
@@ -70,6 +71,35 @@ export async function matchArticleToQuestion(
     return { matchType: 'UNRELATED', reason: `codex returned unparseable match result: ${raw.slice(0, 200)}` };
   }
   return { matchType, reason: typeof parsed?.reason === 'string' ? parsed.reason : '' };
+}
+
+// Judges whether an article can actually answer a specific KIN question.
+// LLM judgments aren't deterministic, and this pipeline publishes to a real
+// public site unattended — a single roll of the dice deciding "this article
+// answers this question" is too fragile. Call the judge twice and only
+// trust the result when both calls agree; on disagreement, take whichever
+// of the two is more conservative (closer to UNRELATED) rather than
+// guessing, since a false negative (skipped question) costs nothing but a
+// false positive (wrong-article answer) costs a real, public mistake.
+export async function matchArticleToQuestion(
+  article: Article,
+  question: QuestionContent
+): Promise<{ matchType: MatchType; reason: string; agreed: boolean }> {
+  const [first, second] = await Promise.all([
+    callMatchOnce(article, question),
+    callMatchOnce(article, question),
+  ]);
+
+  if (first.matchType === second.matchType) {
+    return { ...first, agreed: true };
+  }
+
+  const conservative = MATCH_RANK[first.matchType] <= MATCH_RANK[second.matchType] ? first : second;
+  return {
+    matchType: conservative.matchType,
+    reason: `판단 불일치(${first.matchType} vs ${second.matchType}) — 보수적 결과 채택: ${conservative.reason}`,
+    agreed: false,
+  };
 }
 
 function parseJsonArray(raw: string): string[] {
