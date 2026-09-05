@@ -36,10 +36,19 @@ export async function postAnswer(
     return { success: false, state: 'EMPTY', error: `Navigation failed: ${e}` };
   }
 
-  // 2. Check answer button exists
-  const canAnswer = await page.evaluate(() =>
-    !!document.querySelector('.endAnswerRegisterButton._answerWriteButton')
-  );
+  // 2. Check answer button exists.
+  //    Naver renders two buttons that open the same editor: a header/inline
+  //    one (.endAnswerButton._answerWriteButton, always in the DOM) and a
+  //    scroll-triggered floating one (.endAnswerRegisterButton._answerWriteButton,
+  //    hidden until the page is scrolled). Prefer whichever is actually visible.
+  const floatingBtn = page.locator('.endAnswerRegisterButton._answerWriteButton').first();
+  const inlineBtn = page.locator('.endAnswerButton._answerWriteButton').first();
+  let answerBtn = floatingBtn;
+  let canAnswer = await floatingBtn.isVisible().catch(() => false);
+  if (!canAnswer) {
+    canAnswer = await inlineBtn.isVisible().catch(() => false);
+    if (canAnswer) answerBtn = inlineBtn;
+  }
   if (!canAnswer) {
     return { success: false, state: 'EMPTY', error: 'No answer button' };
   }
@@ -51,13 +60,23 @@ export async function postAnswer(
     await d.accept();
   });
 
-  await page.evaluate(() => {
-    (document.querySelector('.endAnswerRegisterButton._answerWriteButton') as HTMLElement)?.click();
-  });
+  // Real pointer click — SmartEditor only opens on a genuine mouse click;
+  // a DOM-level element.click() (via page.evaluate) does not trigger it.
+  // The click can silently no-op if the page's own JS hasn't finished
+  // binding its handlers yet (a domcontentloaded nav can beat that), so
+  // retry once after a longer settle wait before giving up.
+  await answerBtn.click({ timeout: 5000 });
   await page.waitForTimeout(2500);
 
   if (dialogMsg) {
     return { success: false, state: 'EMPTY', error: `Dialog: ${dialogMsg}` };
+  }
+
+  const hasCanvasAfterClick = await page.evaluate(() => !!document.querySelector('.se-canvas'));
+  if (!hasCanvasAfterClick) {
+    await page.waitForTimeout(2000);
+    await answerBtn.click({ timeout: 5000 }).catch(() => { /* fall through to canvas check below */ });
+    await page.waitForTimeout(2500);
   }
 
   // 4. Scroll SE canvas into viewport
@@ -105,7 +124,9 @@ export async function postAnswer(
   await page.waitForTimeout(400);
   await page.keyboard.press('Enter');
 
-  // 8. Wait for OG card (poll up to 8s)
+  // 8. Wait for OG card (poll up to 8s). The card can flicker in and out
+  //    while Naver fetches the link preview, so a single positive poll isn't
+  //    enough — re-check after a settle delay before trusting it.
   let ogReady = false;
   for (let i = 0; i < 8; i++) {
     await page.waitForTimeout(1000);
@@ -120,47 +141,21 @@ export async function postAnswer(
     return { success: false, state: 'TEXT_INSERTED', error: 'OG card did not render' };
   }
 
-  // 9. Delete raw URL — it is appended to the last <p> of the last text component
-  //    Strategy: click last p, press End, Backspace × url.length
-  const urlLen = articleUrl.length;
-
-  // Scroll last text comp into view
-  await page.evaluate((sel: string) => {
-    const comps = Array.from(document.querySelectorAll(sel));
-    const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-    textComps[textComps.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, COMP_SEL);
-  await page.waitForTimeout(500);
-
-  const lastPPos = await page.evaluate((sel: string) => {
-    const comps = Array.from(document.querySelectorAll(sel));
-    const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-    const lastComp = textComps[textComps.length - 1];
-    if (!lastComp) return null;
-    const paras = Array.from(lastComp.querySelectorAll('p'));
-    const lastP = paras[paras.length - 1];
-    if (!lastP) return null;
-    const r = lastP.getBoundingClientRect();
-    return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
-  }, COMP_SEL);
-
-  if (!lastPPos) {
-    await saveArtifact(page, questionUrl, 'LAST_P_NOT_FOUND');
-    return { success: false, state: 'OG_RENDERED', error: 'Last p not found' };
+  // Settle check — confirm the card is still there a moment later.
+  await page.waitForTimeout(1500);
+  ogReady = await page.evaluate((sel: string) => !!document.querySelector(sel), OG_SEL);
+  if (!ogReady) {
+    await saveArtifact(page, questionUrl, 'OG_DISAPPEARED_AFTER_SETTLE');
+    return { success: false, state: 'TEXT_INSERTED', error: 'OG card disappeared after settle wait' };
   }
 
-  await page.mouse.click(lastPPos.x, lastPPos.y);
-  await page.waitForTimeout(200);
-  await page.keyboard.press('End');
-  await page.waitForTimeout(100);
-
-  for (let i = 0; i < urlLen; i++) {
-    await page.keyboard.press('Backspace');
-  }
-  await page.waitForTimeout(300);
-
-  // Verify raw URL gone from text components
-  const rawUrlPresent = await page.evaluate(
+  // 9. Delete raw URL if SmartEditor left it behind as text.
+  //    SmartEditor normally converts the typed URL into the OG card and
+  //    leaves an empty trailing paragraph — no raw URL text remains. In that
+  //    case this step must be skipped entirely: the last text component is
+  //    empty, so Backspace would run past its start and delete into the
+  //    OG card component before it, destroying the card we just rendered.
+  let rawUrlPresent = await page.evaluate(
     ({ sel, url }: { sel: string; url: string }) => {
       const comps = Array.from(document.querySelectorAll(sel));
       const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
@@ -170,26 +165,86 @@ export async function postAnswer(
   );
 
   if (rawUrlPresent) {
-    await saveArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
-    return { success: false, state: 'OG_RENDERED', error: 'Raw URL still present' };
+    // Find the <p> that actually contains the raw URL text. SmartEditor
+    // does NOT always leave it in a trailing empty component — it can sit
+    // at the end of the very text component we typed the answer into,
+    // right after the OG card is inserted as a separate component after it.
+    // Targeting "the last text component" unconditionally used to grab the
+    // wrong (unrelated, already-empty) component and delete into the OG
+    // card by accident. Search every paragraph in every non-OG component
+    // and act on the one whose own text contains the URL.
+    const urlPPos = await page.evaluate(
+      ({ sel, url }: { sel: string; url: string }) => {
+        const comps = Array.from(document.querySelectorAll(sel));
+        const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+        for (const comp of textComps) {
+          const paras = Array.from(comp.querySelectorAll('p'));
+          for (const p of paras) {
+            if (p.textContent?.includes(url)) {
+              p.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              const r = p.getBoundingClientRect();
+              return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
+            }
+          }
+        }
+        return null;
+      },
+      { sel: COMP_SEL, url: articleUrl }
+    );
+    await page.waitForTimeout(500);
+
+    if (!urlPPos) {
+      await saveArtifact(page, questionUrl, 'LAST_P_NOT_FOUND');
+      return { success: false, state: 'OG_RENDERED', error: 'Paragraph containing raw URL not found' };
+    }
+
+    await page.mouse.click(urlPPos.x, urlPPos.y);
+    await page.waitForTimeout(200);
+
+    // Select the whole trailing paragraph (Home, then Shift+End) and delete
+    // it in one shot, instead of counting Backspaces. This paragraph only
+    // ever contains the raw URL we just typed (or is already empty because
+    // SmartEditor converted it into the OG card), so selecting its full
+    // extent and deleting can never reach past its own boundary into the
+    // OG card component before it — unlike a fixed-count Backspace loop,
+    // which doesn't know how many raw characters actually remain and can
+    // run past them and destroy the card.
+    await page.keyboard.press('Home');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Shift+End');
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Delete');
+    await page.waitForTimeout(300);
+
+    const ogStillThere = await page.evaluate((sel: string) => !!document.querySelector(sel), OG_SEL);
+    if (!ogStillThere) {
+      await saveArtifact(page, questionUrl, 'OG_DESTROYED_DURING_URL_DELETE');
+      return { success: false, state: 'OG_RENDERED', error: 'OG card destroyed while removing raw URL text' };
+    }
+
+    rawUrlPresent = await page.evaluate(
+      ({ sel, url }: { sel: string; url: string }) => {
+        const comps = Array.from(document.querySelectorAll(sel));
+        const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+        return textComps.map(c => (c as HTMLElement).innerText.trim()).join('').includes(url);
+      },
+      { sel: COMP_SEL, url: articleUrl }
+    );
+
+    if (rawUrlPresent) {
+      await saveArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
+      return { success: false, state: 'OG_RENDERED', error: 'Raw URL still present' };
+    }
   }
 
-  // 10. Click OG card center to select/center-align it
+  // 10. Scroll OG card into view (no click — clicking it risks landing on its
+  //     hover-revealed delete/edit overlay and destroying the card, which is
+  //     what was happening here before: the card rendered fine but vanished
+  //     right after this click).
   await page.evaluate((sel: string) => {
     document.querySelector(sel)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }, OG_SEL);
   await page.waitForTimeout(500);
-
-  const ogCenter = await page.evaluate((sel: string) => {
-    const og = document.querySelector(sel);
-    const r = og?.getBoundingClientRect();
-    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
-  }, OG_SEL);
-
-  if (ogCenter) {
-    await page.mouse.click(ogCenter.x, ogCenter.y);
-    await page.waitForTimeout(500);
-  }
 
   // 11. Final gate check
   const gate = await page.evaluate(
@@ -218,10 +273,9 @@ export async function postAnswer(
     return { success: true, state: 'CARD_CENTERED' };
   }
 
-  // 12. Submit
-  await page.evaluate(() => {
-    (document.querySelector('.endAnswerButton._answerRegisterButton') as HTMLElement)?.click();
-  });
+  // 12. Submit — real pointer click, same reason as the answer-open button above.
+  const submitBtn = page.locator('.endAnswerButton._answerRegisterButton').first();
+  await submitBtn.click({ timeout: 5000 }).catch(() => { /* handled by post-click URL check below */ });
   await page.waitForTimeout(3000);
 
   const resultUrl = page.url();
