@@ -36,6 +36,15 @@ export function loadAnsweredUrls(): Set<string> {
   return new Set(lines);
 }
 
+// Re-reads the answered-urls file from disk rather than trusting an
+// in-memory Set. daily.ts now waits tens of minutes between answers, during
+// which another run (manual trigger, overlapping schedule) could append to
+// this file — checking the in-memory snapshot alone could let a duplicate
+// answer slip through right before submitting.
+export function isUrlAnswered(questionUrl: string): boolean {
+  return loadAnsweredUrls().has(normalizeKinUrl(questionUrl));
+}
+
 export function appendAnsweredUrl(questionUrl: string) {
   ensureStateDir();
   const key = normalizeKinUrl(questionUrl);

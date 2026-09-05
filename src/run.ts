@@ -106,6 +106,7 @@ async function run() {
   console.log('[RUN] Verifying Naver KIN auth via persistent browser profile...');
 
   const context: BrowserContext = await chromium.launchPersistentContext(PROFILE_DIR, {
+    channel: 'chrome',
     headless: false,
     locale: 'ko-KR',
     timezoneId: 'Asia/Seoul',

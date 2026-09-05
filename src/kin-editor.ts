@@ -5,10 +5,8 @@ import { DRY_RUN } from './config';
 
 export type EditorState =
   | 'EMPTY'
-  | 'TEXT_INSERTED'
   | 'OG_RENDERED'
-  | 'RAW_URL_REMOVED'
-  | 'CARD_CENTERED'
+  | 'ANSWER_TEXT_INSERTED'
   | 'SUBMITTED';
 
 export interface EditorResult {
@@ -36,10 +34,33 @@ export async function postAnswer(
     return { success: false, state: 'EMPTY', error: `Navigation failed: ${e}` };
   }
 
-  // 2. Check answer button exists
-  const canAnswer = await page.evaluate(() =>
-    !!document.querySelector('.endAnswerRegisterButton._answerWriteButton')
-  );
+  // 2. Find the "답변하기"/"답변" CTA that opens the editor. Naver's class
+  //    names have changed before (endAnswerButton vs endAnswerRegisterButton
+  //    across page layouts) and will likely change again, so class-based
+  //    selectors are tried first as the fast path, then a text/role-based
+  //    fallback searches any <button> whose visible text is exactly "답변"
+  //    or "답변하기" — that survives a class rename since it depends on
+  //    what a human would actually read on the button.
+  const classCandidates = [
+    page.locator('.endAnswerRegisterButton._answerWriteButton').first(),
+    page.locator('.endAnswerButton._answerWriteButton').first(),
+  ];
+  let answerBtn = classCandidates[0];
+  let canAnswer = false;
+  for (const candidate of classCandidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      answerBtn = candidate;
+      canAnswer = true;
+      break;
+    }
+  }
+  if (!canAnswer) {
+    const textBtn = page.locator('button', { hasText: /^답변(하기)?$/ }).first();
+    if (await textBtn.isVisible().catch(() => false)) {
+      answerBtn = textBtn;
+      canAnswer = true;
+    }
+  }
   if (!canAnswer) {
     return { success: false, state: 'EMPTY', error: 'No answer button' };
   }
@@ -51,13 +72,23 @@ export async function postAnswer(
     await d.accept();
   });
 
-  await page.evaluate(() => {
-    (document.querySelector('.endAnswerRegisterButton._answerWriteButton') as HTMLElement)?.click();
-  });
+  // Real pointer click — SmartEditor only opens on a genuine mouse click;
+  // a DOM-level element.click() (via page.evaluate) does not trigger it.
+  // The click can silently no-op if the page's own JS hasn't finished
+  // binding its handlers yet (a domcontentloaded nav can beat that), so
+  // retry once after a longer settle wait before giving up.
+  await answerBtn.click({ timeout: 5000 });
   await page.waitForTimeout(2500);
 
   if (dialogMsg) {
     return { success: false, state: 'EMPTY', error: `Dialog: ${dialogMsg}` };
+  }
+
+  const hasCanvasAfterClick = await page.evaluate(() => !!document.querySelector('.se-canvas'));
+  if (!hasCanvasAfterClick) {
+    await page.waitForTimeout(2000);
+    await answerBtn.click({ timeout: 5000 }).catch(() => { /* fall through to canvas check below */ });
+    await page.waitForTimeout(2500);
   }
 
   // 4. Scroll SE canvas into viewport
@@ -72,6 +103,7 @@ export async function postAnswer(
     return r ? { top: r.top, left: r.left, height: r.height } : null;
   });
   if (!canvasRect) {
+    await saveArtifact(page, questionUrl, 'SE_CANVAS_NOT_FOUND');
     return { success: false, state: 'EMPTY', error: 'SE canvas not found' };
   }
 
@@ -79,32 +111,28 @@ export async function postAnswer(
   await page.mouse.click(canvasRect.left + 100, canvasRect.top + canvasRect.height * 0.6);
   await page.waitForTimeout(300);
 
-  // 6. Type answer text (keyboard.type is the only reliable method for SmartEditor)
-  await page.keyboard.type(answerText, { delay: 20 });
-  await page.waitForTimeout(400);
-
-  // Verify text registered in SE component model
-  const textLen = await page.evaluate((sel: string) => {
-    const comps = Array.from(document.querySelectorAll(sel));
-    return comps
-      .filter(c => !c.classList.contains('se-oglink'))
-      .map(c => (c as HTMLElement).innerText.trim())
-      .join('').length;
-  }, COMP_SEL);
-
-  if (textLen < 50) {
-    await saveArtifact(page, questionUrl, 'TEXT_INSERT_FAILED');
-    return { success: false, state: 'EMPTY', error: `Text too short: ${textLen}` };
-  }
-
-  // 7. Press Enter then type URL to trigger OG card
-  await page.keyboard.press('Enter');
-  await page.waitForTimeout(200);
+  // 6. Type the article URL FIRST, on its own line, before the answer text.
+  //    This is the opposite of the obvious order, but it is what makes safe
+  //    raw-URL cleanup possible: typed first, the URL becomes its own
+  //    isolated leading component once Naver converts it into an OG card,
+  //    with nothing else sharing that component. Typed after the answer
+  //    text (the original approach), the leftover raw-URL text instead
+  //    lands inside (or right next to) components that also hold the real
+  //    answer or the OG card, and every attempted deletion there — counted
+  //    Backspaces, Home+Shift+End+Delete, repeated Home+Delete — ended up
+  //    either destroying the OG card or leaving a mangled partial-URL
+  //    fragment behind, because Naver auto-links the URL and a single
+  //    Delete/Backspace on that auto-link removes an unpredictable chunk
+  //    rather than the whole link atomically. With the URL isolated in its
+  //    own component, a triple-click cleanly selects that entire paragraph
+  //    and Delete removes it in one shot with no neighboring content at risk.
   await page.keyboard.type(articleUrl, { delay: 25 });
   await page.waitForTimeout(400);
   await page.keyboard.press('Enter');
 
-  // 8. Wait for OG card (poll up to 8s)
+  // 7. Wait for OG card (poll up to 8s). The card can flicker in and out
+  //    while Naver fetches the link preview, so a single positive poll isn't
+  //    enough — re-check after a settle delay before trusting it.
   let ogReady = false;
   for (let i = 0; i < 8; i++) {
     await page.waitForTimeout(1000);
@@ -116,111 +144,156 @@ export async function postAnswer(
   }
   if (!ogReady) {
     await saveArtifact(page, questionUrl, 'OG_NOT_RENDERED');
-    return { success: false, state: 'TEXT_INSERTED', error: 'OG card did not render' };
+    return { success: false, state: 'EMPTY', error: 'OG card did not render' };
   }
 
-  // 9. Delete raw URL — it is appended to the last <p> of the last text component
-  //    Strategy: click last p, press End, Backspace × url.length
-  const urlLen = articleUrl.length;
-
-  // Scroll last text comp into view
-  await page.evaluate((sel: string) => {
-    const comps = Array.from(document.querySelectorAll(sel));
-    const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-    textComps[textComps.length - 1]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, COMP_SEL);
-  await page.waitForTimeout(500);
-
-  const lastPPos = await page.evaluate((sel: string) => {
-    const comps = Array.from(document.querySelectorAll(sel));
-    const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-    const lastComp = textComps[textComps.length - 1];
-    if (!lastComp) return null;
-    const paras = Array.from(lastComp.querySelectorAll('p'));
-    const lastP = paras[paras.length - 1];
-    if (!lastP) return null;
-    const r = lastP.getBoundingClientRect();
-    return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
-  }, COMP_SEL);
-
-  if (!lastPPos) {
-    await saveArtifact(page, questionUrl, 'LAST_P_NOT_FOUND');
-    return { success: false, state: 'OG_RENDERED', error: 'Last p not found' };
+  // Settle check — confirm the card is still there a moment later.
+  await page.waitForTimeout(1500);
+  ogReady = await page.evaluate((sel: string) => !!document.querySelector(sel), OG_SEL);
+  if (!ogReady) {
+    await saveArtifact(page, questionUrl, 'OG_DISAPPEARED_AFTER_SETTLE');
+    return { success: false, state: 'EMPTY', error: 'OG card disappeared after settle wait' };
   }
 
-  await page.mouse.click(lastPPos.x, lastPPos.y);
-  await page.waitForTimeout(200);
-  await page.keyboard.press('End');
-  await page.waitForTimeout(100);
-
-  for (let i = 0; i < urlLen; i++) {
-    await page.keyboard.press('Backspace');
-  }
-  await page.waitForTimeout(300);
-
-  // Verify raw URL gone from text components
-  const rawUrlPresent = await page.evaluate(
-    ({ sel, url }: { sel: string; url: string }) => {
+  // 8. Delete the leading raw-URL paragraph via triple-click (selects the
+  //    whole paragraph as one unit) + Delete, then Backspace once to merge
+  //    away the now-empty line. This never touches the OG card or answer
+  //    text because the URL was typed into its own isolated component.
+  const hasStrayUrlText = () => page.evaluate(
+    (sel: string) => {
       const comps = Array.from(document.querySelectorAll(sel));
       const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
-      return textComps.map(c => (c as HTMLElement).innerText.trim()).join('').includes(url);
+      return /https?:\/\//i.test(textComps.map(c => (c as HTMLElement).innerText).join(''));
     },
-    { sel: COMP_SEL, url: articleUrl }
+    COMP_SEL
   );
 
-  if (rawUrlPresent) {
-    await saveArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
-    return { success: false, state: 'OG_RENDERED', error: 'Raw URL still present' };
+  if (await hasStrayUrlText()) {
+    await page.evaluate((sel: string) => {
+      const comps = Array.from(document.querySelectorAll(sel));
+      const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+      const first = textComps[0];
+      const p = first?.querySelector('p');
+      (p as HTMLElement | null)?.scrollIntoView({ behavior: 'instant', block: 'center' });
+    }, COMP_SEL);
+    await page.waitForTimeout(300);
+
+    const urlPPos = await page.evaluate((sel: string) => {
+      const comps = Array.from(document.querySelectorAll(sel));
+      const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
+      const first = textComps[0];
+      const p = first?.querySelector('p');
+      if (!p) return null;
+      const r = (p as HTMLElement).getBoundingClientRect();
+      return { x: r.left + 50, y: (r.top + r.bottom) / 2 };
+    }, COMP_SEL);
+
+    if (!urlPPos) {
+      await saveArtifact(page, questionUrl, 'LAST_P_NOT_FOUND');
+      return { success: false, state: 'OG_RENDERED', error: 'Paragraph containing raw URL not found' };
+    }
+
+    await page.mouse.click(urlPPos.x, urlPPos.y, { clickCount: 3 });
+    await page.waitForTimeout(200);
+    await page.keyboard.press('Delete');
+    await page.waitForTimeout(200);
+    await page.keyboard.press('Backspace');
+    await page.waitForTimeout(300);
+
+    const ogStillThere = await page.evaluate((sel: string) => !!document.querySelector(sel), OG_SEL);
+    if (!ogStillThere) {
+      await saveArtifact(page, questionUrl, 'OG_DESTROYED_DURING_URL_DELETE');
+      return { success: false, state: 'OG_RENDERED', error: 'OG card destroyed while removing raw URL text' };
+    }
+
+    if (await hasStrayUrlText()) {
+      await saveArtifact(page, questionUrl, 'RAW_URL_REMOVAL_FAILED');
+      return { success: false, state: 'OG_RENDERED', error: 'Raw URL text still present' };
+    }
   }
 
-  // 10. Click OG card center to select/center-align it
+  // 9. Move the caret to the very start of the editor and type the answer
+  //    text there, so it ends up before the OG card in reading order.
+  const canvasPos = await page.evaluate(() => {
+    const c = document.querySelector('.se-canvas');
+    const r = c?.getBoundingClientRect();
+    return r ? { x: r.left + 100, y: r.top + 20 } : null;
+  });
+  if (canvasPos) {
+    await page.mouse.click(canvasPos.x, canvasPos.y);
+    await page.waitForTimeout(200);
+  }
+  await page.keyboard.press('Control+Home');
+  await page.waitForTimeout(100);
+  await page.keyboard.type(answerText, { delay: 20 });
+  await page.waitForTimeout(400);
+
+  const textLen = await page.evaluate((sel: string) => {
+    const comps = Array.from(document.querySelectorAll(sel));
+    return comps
+      .filter(c => !c.classList.contains('se-oglink'))
+      .map(c => (c as HTMLElement).innerText.trim())
+      .join('').length;
+  }, COMP_SEL);
+
+  if (textLen < 50) {
+    await saveArtifact(page, questionUrl, 'TEXT_INSERT_FAILED');
+    return { success: false, state: 'OG_RENDERED', error: `Text too short: ${textLen}` };
+  }
+
+  // 10. Scroll OG card into view (no click — clicking it risks landing on its
+  //     hover-revealed delete/edit overlay and destroying the card).
   await page.evaluate((sel: string) => {
     document.querySelector(sel)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }, OG_SEL);
   await page.waitForTimeout(500);
 
-  const ogCenter = await page.evaluate((sel: string) => {
-    const og = document.querySelector(sel);
-    const r = og?.getBoundingClientRect();
-    return r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
-  }, OG_SEL);
-
-  if (ogCenter) {
-    await page.mouse.click(ogCenter.x, ogCenter.y);
-    await page.waitForTimeout(500);
-  }
-
-  // 11. Final gate check
+  // 11. Final gate check. Checks for ANY leftover http(s) text, not just an
+  //     exact match on the original URL string, in case any stray fragment
+  //     survived step 8.
   const gate = await page.evaluate(
-    ({ compSel, url }: { compSel: string; url: string }) => {
+    (compSel: string) => {
       const comps = Array.from(document.querySelectorAll(compSel));
       const textComps = comps.filter(c => !c.classList.contains('se-oglink'));
       const totalText = textComps.map(c => (c as HTMLElement).innerText.trim()).join('');
       const hasOg = comps.some(c => c.classList.contains('se-oglink'));
-      const rawUrl = totalText.includes(url);
+      const rawUrl = /https?:\/\//i.test(totalText);
       return { textLen: totalText.length, hasOg, rawUrl };
     },
-    { compSel: COMP_SEL, url: articleUrl }
+    COMP_SEL
   );
 
   if (gate.textLen < 50 || !gate.hasOg || gate.rawUrl) {
     await saveArtifact(page, questionUrl, 'GATE_FAILED');
     return {
       success: false,
-      state: 'CARD_CENTERED',
+      state: 'ANSWER_TEXT_INSERTED',
       error: `Gate failed: textLen=${gate.textLen} hasOg=${gate.hasOg} rawUrl=${gate.rawUrl}`,
     };
   }
 
   if (DRY_RUN) {
     console.log('[DRYRUN] Gate passed — skipping submit');
-    return { success: true, state: 'CARD_CENTERED' };
+    return { success: true, state: 'ANSWER_TEXT_INSERTED' };
   }
 
-  // 12. Submit
-  await page.evaluate(() => {
-    (document.querySelector('.endAnswerButton._answerRegisterButton') as HTMLElement)?.click();
-  });
+  // 12. Submit ("등록" button next to "저장") — same class-then-text
+  //     fallback strategy as the answer-open CTA above, for the same reason:
+  //     class names on this page have already changed once and can again.
+  let submitBtn = page.locator('.endAnswerButton._answerRegisterButton').first();
+  let canSubmit = await submitBtn.isVisible().catch(() => false);
+  if (!canSubmit) {
+    const textSubmitBtn = page.locator('button', { hasText: /^등록$/ }).first();
+    if (await textSubmitBtn.isVisible().catch(() => false)) {
+      submitBtn = textSubmitBtn;
+      canSubmit = true;
+    }
+  }
+  if (!canSubmit) {
+    await saveArtifact(page, questionUrl, 'SUBMIT_BUTTON_NOT_FOUND');
+    return { success: false, state: 'ANSWER_TEXT_INSERTED', error: 'No submit ("등록") button found' };
+  }
+  await submitBtn.click({ timeout: 5000 }).catch(() => { /* handled by post-click URL check below */ });
   await page.waitForTimeout(3000);
 
   const resultUrl = page.url();

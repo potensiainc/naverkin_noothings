@@ -5,6 +5,7 @@ dist/
 browser-profile/
 state/answered_urls.txt
 state/answer_log.csv
+state/daily.log
 artifacts/
 .playwright-mcp/
 *.js.map
