@@ -21,26 +21,26 @@ const OG_SEL = '.se-canvas .se-component.se-oglink:not(.__se-component)';
 // SmartEditor selector for all user-created components
 const COMP_SEL = '.se-canvas .se-component:not(.__se-component)';
 
-export async function postAnswer(
-  page: Page,
-  questionUrl: string,
-  answerText: string,
-  articleUrl: string
-): Promise<EditorResult> {
-  // 1. Navigate to question page
-  try {
-    await page.goto(questionUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-  } catch (e) {
-    return { success: false, state: 'EMPTY', error: `Navigation failed: ${e}` };
-  }
+export interface OpenEditorResult {
+  opened: boolean;
+  error?: string;
+}
 
-  // 2. Find the "답변하기"/"답변" CTA that opens the editor. Naver's class
-  //    names have changed before (endAnswerButton vs endAnswerRegisterButton
-  //    across page layouts) and will likely change again, so class-based
-  //    selectors are tried first as the fast path, then a text/role-based
-  //    fallback searches any <button> whose visible text is exactly "답변"
-  //    or "답변하기" — that survives a class rename since it depends on
-  //    what a human would actually read on the button.
+// Finds the "답변하기"/"답변" CTA and clicks it to open the SmartEditor,
+// reporting whether Naver rejected the attempt outright (e.g. a
+// "답변이 허용되지 않는 디렉토리입니다" dialog on FAQ-only / government-partner
+// categories, where no article — however well matched — could ever be
+// posted). Exported separately from postAnswer so daily.ts can call this
+// as a cheap pre-check right after reading the question, before spending a
+// codex call on matching/generation for a question that can never accept
+// an answer.
+export async function openAnswerEditor(page: Page): Promise<OpenEditorResult> {
+  // Naver's class names have changed before (endAnswerButton vs
+  // endAnswerRegisterButton across page layouts) and will likely change
+  // again, so class-based selectors are tried first as the fast path, then
+  // a text/role-based fallback searches any <button> whose visible text is
+  // exactly "답변" or "답변하기" — that survives a class rename since it
+  // depends on what a human would actually read on the button.
   const classCandidates = [
     page.locator('.endAnswerRegisterButton._answerWriteButton').first(),
     page.locator('.endAnswerButton._answerWriteButton').first(),
@@ -62,10 +62,10 @@ export async function postAnswer(
     }
   }
   if (!canAnswer) {
-    return { success: false, state: 'EMPTY', error: 'No answer button' };
+    return { opened: false, error: 'No answer button' };
   }
 
-  // 3. Click answer button — catch dialog (e.g. "답변이 허용되지 않는 디렉토리")
+  // Click answer button — catch dialog (e.g. "답변이 허용되지 않는 디렉토리")
   let dialogMsg: string | null = null;
   page.once('dialog', async (d) => {
     dialogMsg = d.message();
@@ -81,7 +81,7 @@ export async function postAnswer(
   await page.waitForTimeout(2500);
 
   if (dialogMsg) {
-    return { success: false, state: 'EMPTY', error: `Dialog: ${dialogMsg}` };
+    return { opened: false, error: `Dialog: ${dialogMsg}` };
   }
 
   const hasCanvasAfterClick = await page.evaluate(() => !!document.querySelector('.se-canvas'));
@@ -89,6 +89,28 @@ export async function postAnswer(
     await page.waitForTimeout(2000);
     await answerBtn.click({ timeout: 5000 }).catch(() => { /* fall through to canvas check below */ });
     await page.waitForTimeout(2500);
+  }
+
+  return { opened: true };
+}
+
+export async function postAnswer(
+  page: Page,
+  questionUrl: string,
+  answerText: string,
+  articleUrl: string
+): Promise<EditorResult> {
+  // 1. Navigate to question page
+  try {
+    await page.goto(questionUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  } catch (e) {
+    return { success: false, state: 'EMPTY', error: `Navigation failed: ${e}` };
+  }
+
+  // 2-3. Open the editor (button lookup + click + dialog detection).
+  const opened = await openAnswerEditor(page);
+  if (!opened.opened) {
+    return { success: false, state: 'EMPTY', error: opened.error ?? 'Failed to open editor' };
   }
 
   // 4. Scroll SE canvas into viewport

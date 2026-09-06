@@ -129,6 +129,16 @@ async function main() {
             continue;
           }
 
+          // 이 질문의 카테고리 자체가 일반 회원 답변을 막아두는 경우
+          // (정부기관 FAQ 전용 dirId 등) 매칭/생성 codex 호출은 의미가
+          // 없다 — 아무리 잘 맞는 글이라도 등록 시 네이버가 "답변이
+          // 허용되지 않는 디렉토리입니다" 다이얼로그로 거부한다. readQuestion이
+          // 이미 실제로 답변 버튼을 클릭해 확인했으므로 여기서 바로 스킵한다.
+          if (!question.answerable) {
+            console.log(`    SKIP (답변 불가 디렉토리): ${question.title.slice(0, 40)}`);
+            continue;
+          }
+
           // 글-질문 적합성 판단 (DIRECT/SAME_PROBLEM/ADJACENT_ANSWERABLE만 진행)
           let matchType: string;
           try {

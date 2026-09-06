@@ -1,6 +1,7 @@
 import { Page } from 'playwright';
 import { config } from './config';
 import { QuestionContent } from './question-matcher';
+import { openAnswerEditor } from './kin-editor';
 
 export interface SearchResult {
   questionUrl: string;
@@ -119,7 +120,7 @@ export async function readQuestion(page: Page, url: string): Promise<QuestionCon
     return null;
   }
 
-  return page.evaluate(() => {
+  const basic = await page.evaluate(() => {
     // Title: from page <title> tag, strip " : 지식iN"
     const rawTitle = document.title.replace(/\s*:\s*지식iN\s*$/, '').trim();
 
@@ -171,6 +172,25 @@ export async function readQuestion(page: Page, url: string): Promise<QuestionCon
     if (!rawTitle || rawTitle === '페이지 없음') return null;
     return { title: rawTitle, body };
   });
+
+  if (!basic) return null;
+
+  // Cheaply verify this question's category actually accepts member answers
+  // before any codex call is spent on it. Some categories (government-FAQ
+  // dirIds answered only by official "지식파트너" accounts) show a
+  // "답변이 허용되지 않는 디렉토리입니다" dialog the moment the answer
+  // button is clicked, regardless of how well an article matches — no
+  // amount of good matching or generation can ever get an answer posted
+  // there. openAnswerEditor() opens/clicks the same way postAnswer() will,
+  // so this check is exact rather than a guess based on page text.
+  const opened = await openAnswerEditor(page);
+
+  // Reload to leave the page in the same clean state postAnswer() expects
+  // when it navigates back here later, regardless of whether the editor
+  // ended up open.
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+
+  return { ...basic, answerable: opened.opened };
 }
 
 // Navigates to KIN and checks session health via the NID_AUT auth cookie.
