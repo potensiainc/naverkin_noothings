@@ -10,10 +10,16 @@ export interface SearchResult {
   answerCount: number;
 }
 
+// Naver KIN search only supports these three sort values (정확도/최신순/추천순).
+// A previous version invented a non-existent "answer_asc" (미답변순) sort —
+// Naver silently returns a completely blank page for any unrecognized sort
+// value, which made every search using it return zero results.
+export type KinSearchSort = 'none' | 'date' | 'vcount';
+
 export async function searchKin(
   page: Page,
   query: string,
-  sort: 'date' | 'answer_asc' = 'date',
+  sort: KinSearchSort = 'date',
   maxResults: number = config.resultsPerQuery
 ): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
@@ -27,7 +33,16 @@ export async function searchKin(
       break;
     }
 
-    const items = await extractSearchItems(page);
+    let items: SearchResult[];
+    try {
+      items = await extractSearchItems(page);
+    } catch {
+      // "Execution context was destroyed" 등 페이지가 아직 안정화되기
+      // 전에 다음 동작이 실행 컨텍스트를 깨뜨리는 경우가 있다. 지금까지
+      // 모은 결과라도 반환하고 이 검색 시도는 여기서 멈춘다 — 통째로
+      // throw하면 daily.ts가 이 쿼리 전체를 스킵하게 되어 결과 손실이 큼.
+      break;
+    }
     if (items.length === 0) break;
 
     for (const item of items) {
@@ -44,12 +59,12 @@ export async function searchKin(
   return results;
 }
 
-function buildSearchUrl(query: string, sort: 'date' | 'answer_asc', page: number): string {
+function buildSearchUrl(query: string, sort: KinSearchSort, page: number): string {
   const base = 'https://kin.naver.com/search/list.naver';
   const params = new URLSearchParams({
     query,
     section: 'qna',
-    sort: sort === 'date' ? 'date' : 'answer',
+    sort,
     page: String(page),
   });
   return `${base}?${params.toString()}`;

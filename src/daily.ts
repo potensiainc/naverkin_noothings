@@ -89,25 +89,24 @@ async function main() {
         if (answeredCount >= config.maxAnswersPerArticle) break;
 
         console.log(`  쿼리: "${query}"`);
-        // 최신순만 쓰면 "어제 막 올라온 글 중 우연히 맞는 것"에 의존하게 되어
-        // 적합한 질문을 놓치기 쉽다. 미답변순(answer_asc)을 병행해 오래됐지만
-        // 아직 답변이 안 달린 질문도 후보에 포함시킨다. docId 기준으로 합쳐
-        // 두 정렬에 동시에 걸린 중복은 제거한다.
+        // 네이버 지식iN 검색이 실제로 지원하는 정렬은 정확도(none)/
+        // 최신순(date)/추천순(vcount) 세 가지뿐이다. "미답변순"이라는
+        // 정렬은 존재하지 않는데, 이전에 sort=answer라는 값을 임의로
+        // 만들어 병행 검색을 시도한 적이 있다 — 네이버는 인식 못 하는
+        // sort 값에 완전히 빈 페이지로 응답하고, 게다가 그 병행 호출을
+        // Promise.all로 같은 page 객체에 동시 실행하는 바람에 두
+        // 네비게이션이 서로의 실행 컨텍스트를 깨뜨려 정상적인 date
+        // 검색 결과까지 0건이 되는 레이스 컨디션까지 겹쳤다. 그 결과
+        // 실제로 하루 전체 실행에서 단 한 건도 등록되지 못한 사고가
+        // 있었다. 존재가 확인된 최신순만 사용한다.
         let results;
         try {
-          const [byDate, byUnanswered] = await Promise.all([
-            searchKin(page, query, 'date'),
-            searchKin(page, query, 'answer_asc'),
-          ]);
-          const seen = new Set<string>();
-          results = [...byDate, ...byUnanswered].filter(r => {
-            if (seen.has(r.docId)) return false;
-            seen.add(r.docId);
-            return true;
-          });
-        } catch {
+          results = await searchKin(page, query, 'date');
+        } catch (e) {
+          console.error(`    검색 실패, 다음 쿼리로: ${e}`);
           continue;
         }
+        console.log(`    검색 결과 ${results.length}건`);
 
         for (const result of results) {
           if (answeredCount >= config.maxAnswersPerArticle) break;
