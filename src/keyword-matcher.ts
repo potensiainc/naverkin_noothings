@@ -81,14 +81,21 @@ async function callMatchOnce(article: Article, question: QuestionContent): Promi
 // of the two is more conservative (closer to UNRELATED) rather than
 // guessing, since a false negative (skipped question) costs nothing but a
 // false positive (wrong-article answer) costs a real, public mistake.
+//
+// The two calls run sequentially, not via Promise.all. Two `codex exec`
+// processes launched at the same instant intermittently crash each other
+// with a Rust panic in codex's own starlark dependency (an
+// Option::unwrap() on None, observed during E2E verification on
+// 2026-09-07) — this is a codex CLI concurrency bug, not something our
+// code can catch cleanly, since it kills the child process before it ever
+// writes the output file. Running one full call after the other avoids
+// triggering it, at the cost of roughly doubling this function's latency.
 export async function matchArticleToQuestion(
   article: Article,
   question: QuestionContent
 ): Promise<{ matchType: MatchType; reason: string; agreed: boolean }> {
-  const [first, second] = await Promise.all([
-    callMatchOnce(article, question),
-    callMatchOnce(article, question),
-  ]);
+  const first = await callMatchOnce(article, question);
+  const second = await callMatchOnce(article, question);
 
   if (first.matchType === second.matchType) {
     return { ...first, agreed: true };
