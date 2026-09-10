@@ -11,6 +11,14 @@
 # 여러 개면 실행 시간이 몇 시간에 이를 수 있다. ExecutionTimeLimit을
 # 넉넉히 12시간으로 잡아 그 안에 강제 종료되지 않게 한다.
 
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principalCheck = [Security.Principal.WindowsPrincipal]::new($identity)
+$isAdmin = $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+  Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+  exit
+}
+
 $taskName = "nothingz-kin-daily"
 $projectDir = "D:\naverkin_noothings"
 $action = New-ScheduledTaskAction `
@@ -18,8 +26,12 @@ $action = New-ScheduledTaskAction `
   -Argument "/c npm run daily >> `"$projectDir\state\daily.log`" 2>&1" `
   -WorkingDirectory $projectDir
 
-# 매일 09:00 실행
-$trigger = New-ScheduledTaskTrigger -Daily -At "09:00AM"
+# 매일 12:00, 17:00, 21:00 실행
+$triggers = @(
+    New-ScheduledTaskTrigger -Daily -At "12:00PM"
+    New-ScheduledTaskTrigger -Daily -At "05:00PM"
+    New-ScheduledTaskTrigger -Daily -At "09:00PM"
+)
 
 $settings = New-ScheduledTaskSettingsSet `
   -ExecutionTimeLimit (New-TimeSpan -Hours 12) `
@@ -33,12 +45,12 @@ $principal = New-ScheduledTaskPrincipal `
 Register-ScheduledTask `
   -TaskName $taskName `
   -Action $action `
-  -Trigger $trigger `
+  -Trigger $triggers `
   -Settings $settings `
   -Principal $principal `
-  -Force
+  -Force -ErrorAction Stop
 
-Write-Host "Task '$taskName' 등록 완료 — 매일 09:00 자동 실행 (Interactive)"
+Write-Host "Task '$taskName' 등록 완료 — 매일 12:00, 17:00, 21:00 자동 실행 (Interactive)"
 Write-Host "로그: $projectDir\state\daily.log"
 Write-Host ""
 Write-Host "수동 실행: Start-ScheduledTask -TaskName '$taskName'"
