@@ -1,7 +1,7 @@
 {
   "site": "https://noothings.kr",
   "timezone": "Asia/Seoul",
-  "queriesPerArticle": 8,
+  "queriesPerArticle": 12,
   "resultsPerQuery": 12,
   "maxAnswersPerArticle": 5,
   "submitRetry": 1,
