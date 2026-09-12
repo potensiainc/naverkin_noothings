@@ -6,6 +6,7 @@ browser-profile/
 state/answered_urls.txt
 state/answer_log.csv
 state/daily.log
+state/daily-goal.json
 artifacts/
 .playwright-mcp/
 *.js.map

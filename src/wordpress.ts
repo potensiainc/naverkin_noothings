@@ -89,6 +89,41 @@ export async function fetchYesterdayArticles(): Promise<Article[]> {
     }));
 }
 
+export async function fetchAllPublishedArticles(): Promise<Article[]> {
+  const articles: Article[] = [];
+  let page = 1;
+  let totalPages = 1;
+
+  do {
+    const url = new URL(`${config.site}/wp-json/wp/v2/posts`);
+    url.searchParams.set('status', 'publish');
+    url.searchParams.set('per_page', '100');
+    url.searchParams.set('page', String(page));
+    url.searchParams.set('orderby', 'date');
+    url.searchParams.set('order', 'desc');
+
+    const res = await fetch(url.toString());
+    if (!res.ok) throw new Error(`WordPress API error: ${res.status} ${res.statusText}`);
+    totalPages = Math.max(1, Number(res.headers.get('x-wp-totalpages') ?? '1'));
+    const posts = await res.json() as Array<{
+      id: number;
+      date: string;
+      link: string;
+      title: { rendered: string };
+      content: { rendered: string };
+    }>;
+    articles.push(...posts.map(p => ({
+      id: p.id,
+      title: p.title.rendered.replace(/&amp;/g, '&').replace(/&#8211;/g, '–').replace(/&#8217;/g, '’'),
+      permalink: p.link,
+      publishedAt: p.date,
+      plaintext: htmlToPlaintext(p.content.rendered),
+    })));
+    page++;
+  } while (page <= totalPages);
+
+  return articles;
+}
 export function getTargetDateLabel(): string {
   const nowUtc = new Date();
   const kstOffsetMs = 9 * 60 * 60 * 1000;

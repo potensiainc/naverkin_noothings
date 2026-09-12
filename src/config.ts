@@ -13,6 +13,8 @@ interface Config {
   queriesPerArticle: number;
   resultsPerQuery: number;
   maxAnswersPerArticle: number;
+  dailyAnswerGoal: number;
+  minimumDailyArticlePool: number;
   submitRetry: number;
   navigationRetry: number;
   autoSubmit: boolean;

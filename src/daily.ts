@@ -1,12 +1,19 @@
 import { chromium } from 'playwright';
 import * as path from 'path';
 import { config } from './config';
-import { fetchYesterdayArticles, Article } from './wordpress';
+import { fetchYesterdayArticles, fetchAllPublishedArticles, Article } from './wordpress';
 import { searchKin, readQuestion, checkKinSession } from './kin-search';
 import { generateKinAnswer, critiqueKinAnswer, CodexUsageLimitError } from './answer-writer';
 import { postAnswer } from './kin-editor';
 import { normalizeKinUrl, loadAnsweredUrls, isUrlAnswered, appendAnsweredUrl, appendAnswerLog } from './state';
 import { extractSearchQueries, matchArticleToQuestion } from './keyword-matcher';
+import {
+  buildArticlePlan,
+  getKstDateKey,
+  loadDailyGoalState,
+  remainingDailyAnswers,
+  saveDailyGoalState,
+} from './daily-plan';
 
 const PROFILE_DIR = path.resolve(__dirname, '../browser-profile');
 
@@ -32,20 +39,43 @@ async function main() {
   const startedAt = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
   console.log('[DAILY] 시작:', startedAt);
 
-  // 1. 어제 글 가져오기
+  // 1. 어제 글을 우선하고, 일일 처리 글이 10개 미만이면 전체 발행 글에서 보충한다.
   let articles: Article[];
+  const dateKey = getKstDateKey();
+  const dailyGoalState = loadDailyGoalState(dateKey);
   try {
-    articles = await fetchYesterdayArticles();
+    const yesterdayArticles = await fetchYesterdayArticles();
+    const allArticles = await fetchAllPublishedArticles();
+
+    if (dailyGoalState.articleIds.length > 0) {
+      const byId = new Map(allArticles.map(article => [article.id, article]));
+      articles = dailyGoalState.articleIds
+        .map(id => byId.get(id))
+        .filter((article): article is Article => !!article);
+    } else {
+      articles = buildArticlePlan(
+        yesterdayArticles,
+        allArticles,
+        config.minimumDailyArticlePool
+      );
+      dailyGoalState.articleIds = articles.map(article => article.id);
+      saveDailyGoalState(dailyGoalState);
+    }
   } catch (e) {
     console.error('[DAILY] WordPress 글 가져오기 실패:', e);
     process.exit(1);
   }
 
-  if (articles.length === 0) {
-    console.log('[DAILY] 어제 발행된 글 없음. 종료.');
+  const remainingAtStart = remainingDailyAnswers(config.dailyAnswerGoal, dailyGoalState.successfulAnswers);
+  if (remainingAtStart === 0) {
+    console.log(`[DAILY] 오늘 목표 ${config.dailyAnswerGoal}건 이미 달성. 종료.`);
     return;
   }
-  console.log(`[DAILY] ${articles.length}개 글 처리`);
+  if (articles.length === 0) {
+    console.log('[DAILY] 처리할 발행 글 없음. 종료.');
+    return;
+  }
+  console.log(`[DAILY] ${articles.length}개 글 처리 — 오늘 ${dailyGoalState.successfulAnswers}/${config.dailyAnswerGoal}건, 남은 목표 ${remainingAtStart}건`);
 
   // 2. 브라우저 시작
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
@@ -72,6 +102,7 @@ async function main() {
   try {
     // 4. 글별 처리
     for (const article of articles) {
+      if (remainingDailyAnswers(config.dailyAnswerGoal, dailyGoalState.successfulAnswers) === 0) break;
       console.log(`\n[ARTICLE] [${article.id}] ${article.title}`);
       let answeredCount = 0;
 
@@ -86,6 +117,7 @@ async function main() {
       }
 
       for (const query of queries) {
+        if (remainingDailyAnswers(config.dailyAnswerGoal, dailyGoalState.successfulAnswers) === 0) break;
         if (answeredCount >= config.maxAnswersPerArticle) break;
 
         console.log(`  쿼리: "${query}"`);
@@ -109,6 +141,7 @@ async function main() {
         console.log(`    검색 결과 ${results.length}건`);
 
         for (const result of results) {
+          if (remainingDailyAnswers(config.dailyAnswerGoal, dailyGoalState.successfulAnswers) === 0) break;
           if (answeredCount >= config.maxAnswersPerArticle) break;
 
           // dirId가 없으면 detail.naver가 "유효하지 않은 요청"으로 거부하므로
@@ -213,15 +246,19 @@ async function main() {
             appendAnsweredUrl(cleanUrl);
             answeredUrls.add(key);
             answeredCount++;
-            console.log(`    ✓ SUCCESS answerNo=${editorResult.answerNo}`);
+            dailyGoalState.successfulAnswers++;
+            saveDailyGoalState(dailyGoalState);
+            console.log(`    ✓ SUCCESS answerNo=${editorResult.answerNo} — 오늘 ${dailyGoalState.successfulAnswers}/${config.dailyAnswerGoal}건`);
             appendAnswerLog(logEntry);
 
-            // 매 답변을 고정 간격으로 등록하면 그 자체가 봇 시그니처가 된다.
-            // 42→27→72분을 순환시켜 등록 간격이 기계적으로 보이지 않게 한다.
-            const delayMin = POST_SUCCESS_DELAYS_MIN[delayIndex % POST_SUCCESS_DELAYS_MIN.length];
-            delayIndex++;
-            console.log(`    다음 답변까지 ${delayMin}분 대기...`);
-            await sleep(delayMin * 60 * 1000);
+            // 일일 목표를 채웠으면 다음 실행까지 기다리지 않고 즉시 종료한다.
+            // 목표가 남았을 때만 42→27→72분 간격을 순환한다.
+            if (remainingDailyAnswers(config.dailyAnswerGoal, dailyGoalState.successfulAnswers) > 0) {
+              const delayMin = POST_SUCCESS_DELAYS_MIN[delayIndex % POST_SUCCESS_DELAYS_MIN.length];
+              delayIndex++;
+              console.log(`    다음 답변까지 ${delayMin}분 대기...`);
+              await sleep(delayMin * 60 * 1000);
+            }
           } else {
             console.log(`    ✗ FAILED: ${editorResult.error}`);
             appendAnswerLog(logEntry);
