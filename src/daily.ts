@@ -3,7 +3,7 @@ import * as path from 'path';
 import { config } from './config';
 import { fetchYesterdayArticles, fetchAllPublishedArticles, Article } from './wordpress';
 import { searchKin, readQuestion, checkKinSession } from './kin-search';
-import { generateKinAnswer, critiqueKinAnswer, CodexUsageLimitError } from './answer-writer';
+import { generateVerifiedKinAnswer, selectRelevantEvidence, CodexUsageLimitError } from './answer-writer';
 import { postAnswer } from './kin-editor';
 import { normalizeKinUrl, loadAnsweredUrls, isUrlAnswered, appendAnsweredUrl, appendAnswerLog } from './state';
 import { extractSearchQueries, matchArticleToQuestion } from './keyword-matcher';
@@ -194,32 +194,23 @@ async function main() {
             questionBody: question.body ?? '',
             articleTitle: article.title,
             articleUrl: article.permalink,
-            articleExcerpt: article.plaintext.slice(0, 2000),
+            articleExcerpt: selectRelevantEvidence(article.plaintext, question.title, question.body ?? ''),
           };
           let answerText: string;
           try {
             console.log(`    답변 생성 중: ${question.title.slice(0, 40)}`);
-            answerText = await generateKinAnswer(answerParams);
-          } catch (e) {
-            if (e instanceof CodexUsageLimitError) throw e;
-            console.error(`    답변 생성 실패:`, e);
-            continue;
-          }
-
-          // 자체 품질 검수 — 형식만 보는 에디터 게이트와 달리 실제로 질문에
-          // 답이 되는지, 근거 없는 내용을 지어내지 않았는지 다시 판단한다.
-          try {
-            const critique = await critiqueKinAnswer(answerParams, answerText);
-            if (!critique.passes) {
-              console.log(`    SKIP (품질 검수 불합격): ${critique.reason}`);
+            const verified = await generateVerifiedKinAnswer(answerParams);
+            if (verified.critique.verdict !== 'PASS') {
+              console.log(`    SKIP (품질 검수 ${verified.critique.verdict}): ${verified.critique.reason}`);
               continue;
             }
+            answerText = verified.answerText;
+            console.log(`    품질 검수 통과${verified.rewriteCount > 0 ? ` (재작성 ${verified.rewriteCount}회)` : ''}`);
           } catch (e) {
             if (e instanceof CodexUsageLimitError) throw e;
-            console.error(`    품질 검수 실패, 스킵: docId=${docId}`, e);
+            console.error(`    답변 생성/검수 실패:`, e);
             continue;
           }
-
           // 대기하는 동안 다른 실행이 먼저 답변했을 수 있으므로, 실제
           // 등록 직전에 디스크에서 다시 한 번 중복 여부를 확인한다.
           if (isUrlAnswered(cleanUrl)) {

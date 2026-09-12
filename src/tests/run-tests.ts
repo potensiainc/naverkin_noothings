@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import { normalizeKinUrl, loadAnsweredUrls, appendAnsweredUrl, appendAnswerLog } from '../state';
 import * as fs from 'fs';
 import * as path from 'path';
+import { selectRelevantEvidence } from '../answer-writer';
 
 let passed = 0;
 let failed = 0;
@@ -138,6 +139,29 @@ test('CSV escaping handles commas and quotes', () => {
   assert.strictEqual(escapeCsv('line1\nline2'), '"line1\nline2"');
 });
 
+console.log('\n[TEST 10] Relevant article evidence selection');
+test('selectRelevantEvidence prefers passages matching the question', () => {
+  const unrelated = '날씨가 맑은 날에는 공원을 산책할 수 있습니다. '.repeat(120);
+  const relevant = '주민등록증 온라인 신청 뒤에는 지정된 기간 안에 주민센터를 방문해 지문 등록 절차를 진행해야 합니다.';
+  const evidence = selectRelevantEvidence(
+    `${unrelated} ${relevant} ${unrelated}`,
+    '주민등록증 온라인 신청 후 지문등록 기간',
+    '민증 신청했는데 언제 방문해야 하나요?',
+    500
+  );
+  assert.ok(evidence.includes('주민등록증 온라인 신청'), 'relevant passage should be selected');
+});
+
+test('selectRelevantEvidence keeps a short article intact', () => {
+  const article = '짧은 글 전체 내용입니다. 필요한 절차를 설명합니다.';
+  assert.strictEqual(selectRelevantEvidence(article, '절차', '', 500), article);
+});
+test('selectRelevantEvidence falls back for long text without sentence punctuation', () => {
+  const article = '주민등록증 온라인 신청 지문 등록 절차 '.repeat(300);
+  const evidence = selectRelevantEvidence(article, '주민등록증 신청', '지문 등록', 500);
+  assert.ok(evidence.length > 0, 'evidence should never be empty');
+  assert.ok(evidence.length <= 500, 'fallback should respect maxChars');
+});
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n[TESTS] ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
