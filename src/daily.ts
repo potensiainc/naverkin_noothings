@@ -7,6 +7,7 @@ import { generateVerifiedKinAnswer, selectRelevantEvidence, CodexUsageLimitError
 import { postAnswer } from './kin-editor';
 import { normalizeKinUrl, loadAnsweredUrls, isUrlAnswered, appendAnsweredUrl, appendAnswerLog } from './state';
 import { extractSearchQueries, matchArticleToQuestion } from './keyword-matcher';
+import { buildDiscordFailure, buildDiscordRunSummary, formatKst, notifyDiscord } from './discord-notifier';
 import {
   buildArticlePlan,
   getKstDateKey,
@@ -38,6 +39,19 @@ function sleep(ms: number): Promise<void> {
 async function main() {
   const startedAt = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
   console.log('[DAILY] 시작:', startedAt);
+  const stats = {
+    articles: 0,
+    queries: 0,
+    searchResults: 0,
+    matched: 0,
+    qualityRejected: 0,
+    registrationAttempts: 0,
+    successes: 0,
+    registrationFailures: 0,
+    processingFailures: 0,
+    keywords: [] as string[],
+    stoppedReason: undefined as string | undefined,
+  };
 
   // 1. 어제 글을 우선하고, 일일 처리 글이 10개 미만이면 전체 발행 글에서 보충한다.
   let articles: Article[];
@@ -63,6 +77,7 @@ async function main() {
     }
   } catch (e) {
     console.error('[DAILY] WordPress 글 가져오기 실패:', e);
+    await notifyDiscord(buildDiscordFailure('WordPress 글 가져오기 실패', errorText(e)));
     process.exit(1);
   }
 
@@ -76,6 +91,14 @@ async function main() {
     return;
   }
   console.log(`[DAILY] ${articles.length}개 글 처리 — 오늘 ${dailyGoalState.successfulAnswers}/${config.dailyAnswerGoal}건, 남은 목표 ${remainingAtStart}건`);
+
+  stats.articles = articles.length;
+  await notifyDiscord(
+    '▶️ **네이버 지식iN 자동화 시작**\n' +
+    '• 시작: ' + startedAt + '\n' +
+    '• 처리 예정 글: ' + articles.length + '개\n' +
+    '• 오늘 현재 성공: ' + dailyGoalState.successfulAnswers + '/' + config.dailyAnswerGoal + '건'
+  );
 
   // 2. 브라우저 시작
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
@@ -91,6 +114,7 @@ async function main() {
   const sessionOk = await checkKinSession(page);
   if (!sessionOk) {
     console.error('[DAILY] KIN 세션 만료. 실행 전 npm run auth:naver 필요.');
+    await notifyDiscord(buildDiscordFailure('네이버 로그인 세션 만료', 'npm run auth:naver로 다시 로그인해야 합니다.'));
     await context.close();
     process.exit(1);
   }
@@ -121,6 +145,8 @@ async function main() {
         if (answeredCount >= config.maxAnswersPerArticle) break;
 
         console.log(`  쿼리: "${query}"`);
+        stats.queries++;
+        if (stats.keywords.length < 30) stats.keywords.push(query);
         // 네이버 지식iN 검색이 실제로 지원하는 정렬은 정확도(none)/
         // 최신순(date)/추천순(vcount) 세 가지뿐이다. "미답변순"이라는
         // 정렬은 존재하지 않는데, 이전에 sort=answer라는 값을 임의로
@@ -139,6 +165,8 @@ async function main() {
           continue;
         }
         console.log(`    검색 결과 ${results.length}건`);
+
+        stats.searchResults += results.length;
 
         for (const result of results) {
           if (remainingDailyAnswers(config.dailyAnswerGoal, dailyGoalState.successfulAnswers) === 0) break;
@@ -188,6 +216,8 @@ async function main() {
             continue;
           }
 
+          stats.matched++;
+
           // codex CLI로 답변 생성
           const answerParams = {
             questionTitle: question.title,
@@ -201,6 +231,7 @@ async function main() {
             console.log(`    답변 생성 중: ${question.title.slice(0, 40)}`);
             const verified = await generateVerifiedKinAnswer(answerParams);
             if (verified.critique.verdict !== 'PASS') {
+              stats.qualityRejected++;
               console.log(`    SKIP (품질 검수 ${verified.critique.verdict}): ${verified.critique.reason}`);
               continue;
             }
@@ -217,6 +248,8 @@ async function main() {
             console.log(`    SKIP (등록 직전 재확인 결과 이미 답변됨): docId=${docId}`);
             continue;
           }
+
+          stats.registrationAttempts++;
 
           // SmartEditor에 등록
           console.log(`    등록 시도: docId=${docId}`);
@@ -238,6 +271,7 @@ async function main() {
             answeredUrls.add(key);
             answeredCount++;
             dailyGoalState.successfulAnswers++;
+            stats.successes++;
             saveDailyGoalState(dailyGoalState);
             console.log(`    ✓ SUCCESS answerNo=${editorResult.answerNo} — 오늘 ${dailyGoalState.successfulAnswers}/${config.dailyAnswerGoal}건`);
             appendAnswerLog(logEntry);
@@ -252,7 +286,12 @@ async function main() {
             }
           } else {
             console.log(`    ✗ FAILED: ${editorResult.error}`);
+            stats.registrationFailures++;
             appendAnswerLog(logEntry);
+            await notifyDiscord(buildDiscordFailure(
+              '답변 등록 실패',
+              'docId=' + docId + ', 글=' + article.title + ', 오류=' + (editorResult.error ?? '알 수 없음')
+            ));
             await page.waitForTimeout(3000); // 실패 시에는 짧게만 대기하고 다음 후보로
           }
         }
@@ -267,21 +306,37 @@ async function main() {
       // 내일 스케줄된 실행은 오늘 못 끝낸 나머지를 기존 워크플로우 그대로
       // 이어서 시도하게 된다 (재시도를 위한 별도 상태 저장 불필요).
       stoppedForUsageLimit = true;
-      console.error('\n[DAILY] codex 사용량 한도 도달 — 오늘 작업 종료. 내일 예약 실행에서 이어서 진행됩니다.', e.message);
+      stats.stoppedReason = 'Codex 사용량 한도 도달';
+      console.error('\n[DAILY] codex 사용량 한도 도달 — 현재 실행 종료. 다음 예약 실행에서 이어서 진행됩니다.', e.message);
+      await notifyDiscord(buildDiscordFailure(
+        'Codex 사용량 한도 도달',
+        '현재 실행을 종료하고 다음 예약 실행에서 이어서 시도합니다.'
+      ));
     } else {
       throw e;
     }
   }
 
   await context.close();
+  const finishedAt = formatKst(new Date());
   console.log(
     '\n[DAILY] 완료:',
-    new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }),
+    finishedAt,
     stoppedForUsageLimit ? '(사용량 한도로 조기 종료)' : ''
   );
+  await notifyDiscord(buildDiscordRunSummary({
+    startedAt,
+    finishedAt,
+    ...stats,
+  }));
 }
 
-main().catch(e => {
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+main().catch(async e => {
   console.error('[DAILY] Fatal:', e);
-  process.exit(1);
+  await notifyDiscord(buildDiscordFailure('치명적 실행 오류', errorText(e)));
+  process.exitCode = 1;
 });

@@ -3,6 +3,7 @@ import { normalizeKinUrl, loadAnsweredUrls, appendAnsweredUrl, appendAnswerLog }
 import * as fs from 'fs';
 import * as path from 'path';
 import { selectRelevantEvidence } from '../answer-writer';
+import { buildDiscordFailure, buildDiscordRunSummary } from '../discord-notifier';
 
 let passed = 0;
 let failed = 0;
@@ -161,6 +162,51 @@ test('selectRelevantEvidence falls back for long text without sentence punctuati
   const evidence = selectRelevantEvidence(article, '주민등록증 신청', '지문 등록', 500);
   assert.ok(evidence.length > 0, 'evidence should never be empty');
   assert.ok(evidence.length <= 500, 'fallback should respect maxChars');
+});
+console.log('\n[TEST 11] Discord notification messages');
+test('zero-success run summary is marked as an alert and includes counters', () => {
+  const message = buildDiscordRunSummary({
+    startedAt: 'start',
+    finishedAt: 'finish',
+    articles: 10,
+    queries: 120,
+    searchResults: 348,
+    matched: 32,
+    qualityRejected: 12,
+    processingFailures: 3,
+    registrationAttempts: 5,
+    successes: 0,
+    registrationFailures: 5,
+    keywords: ['민증 온라인 신청'],
+  });
+  assert.ok(message.startsWith('🚨'), 'zero-success summary should be an alert');
+  assert.ok(message.includes('성공: 0건'), 'success count should be included');
+  assert.ok(message.includes('처리 실패: 3건'), 'processing failure count should be included');
+});
+
+test('successful run summary is marked successful and Discord-safe length', () => {
+  const message = buildDiscordRunSummary({
+    startedAt: 'start',
+    finishedAt: 'finish',
+    articles: 10,
+    queries: 20,
+    searchResults: 100,
+    matched: 8,
+    qualityRejected: 2,
+    processingFailures: 0,
+    registrationAttempts: 6,
+    successes: 5,
+    registrationFailures: 1,
+    keywords: Array.from({ length: 100 }, (_, index) => '아주긴검색키워드' + index),
+  });
+  assert.ok(message.startsWith('✅'), 'successful summary should be marked successful');
+  assert.ok(message.length <= 1900, 'message should fit Discord limit');
+});
+
+test('failure notification does not expose webhook configuration', () => {
+  const message = buildDiscordFailure('로그인 실패', '세션이 만료되었습니다.');
+  assert.ok(message.includes('로그인 실패'));
+  assert.ok(!message.includes('DISCORD_WEBHOOK_URL'));
 });
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n[TESTS] ${passed} passed, ${failed} failed`);
