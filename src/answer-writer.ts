@@ -25,6 +25,16 @@ export interface VerifiedAnswer {
 const MAX_REWRITES = 2;
 const REASONING_EFFORT = 'high';
 
+const DISALLOWED_META_PATTERNS = [
+  /참고\s*(?:내용|포스트|글|자료)(?:에는|에서는|에)?[\s\S]{0,100}(?:확인되지|나와 있지|명시되어 있지|포함되어 있지|없습니다|다루지)/i,
+  /제공된\s*(?:내용|정보|자료)(?:에는|에서는|에)?[\s\S]{0,100}(?:확인되지|나와 있지|명시되어 있지|없습니다|다루지)/i,
+  /(?:글|자료|포스트)(?:만으로는|에서는)[\s\S]{0,80}(?:알 수 없|확인할 수 없|판단하기 어렵)/i,
+];
+
+export function hasDisallowedMetaLanguage(answerText: string): boolean {
+  return DISALLOWED_META_PATTERNS.some(pattern => pattern.test(answerText));
+}
+
 export function selectRelevantEvidence(
   articleText: string,
   questionTitle: string,
@@ -67,10 +77,12 @@ export async function generateKinAnswer(params: AnswerParams): Promise<string> {
 - 질문에 대한 직접적인 결론을 첫 문장에 쓸 것
 - 참고 포스트에서 확인되는 사실만 사용하고 없는 내용을 추측하거나 채우지 말 것
 - 자연스러운 2~4문단, 보통 100~300자. 질문에 충분히 답했다면 분량을 억지로 늘리지 말 것
-- 포스트가 질문 일부만 해결할 수 있으면 답할 수 있는 범위를 솔직하게 밝힐 것
+- 포스트가 질문 일부만 해결할 수 있으면 근거가 있는 해결 방법만 자연스럽게 답하고 나머지는 생략할 것
+- 참고 내용에 무엇이 없거나 확인되지 않는다는 출처 한계 문장을 절대 쓰지 말 것
 - URL은 절대 포함하지 않을 것 (시스템이 별도로 추가함)
 - 구어체의 친절한 톤을 사용하되 광고성 표현은 피할 것
 - 답변 텍스트만 출력할 것 (설명·인사·마크다운 헤더 없이)
+- 질문자에게 굳이 필요 없는 면책·한계·검수 설명은 쓰지 말 것
 
 ## 질문
 제목: ${params.questionTitle}
@@ -87,6 +99,13 @@ export async function critiqueKinAnswer(
   params: AnswerParams,
   answerText: string
 ): Promise<AnswerCritique> {
+  if (hasDisallowedMetaLanguage(answerText)) {
+    return {
+      verdict: 'REWRITE',
+      reason: '참고 자료의 한계 설명을 삭제하고 근거가 있는 답변만 직접 작성하세요.',
+    };
+  }
+
   const prompt = `당신은 네이버 지식iN 답변 품질 검수자입니다. 사소한 표현 문제로 답변을 폐기하지 말고
 아래 세 단계 중 하나로 판정하세요.
 
@@ -139,7 +158,8 @@ export async function rewriteKinAnswer(
 ## 수정 규칙
 - 검수 사유에 지적된 문제를 제거하고 질문에 대한 직접적인 결론을 첫 문장에 작성
 - 참고 포스트에서 확인되는 내용만 사용하고, 없는 날짜·수치·절차·기관 정보는 삭제
-- 질문 전체를 해결할 수 없으면 참고 포스트로 확실히 안내할 수 있는 범위를 분명히 표현
+- 질문 전체를 해결할 수 없으면 참고 포스트에서 근거가 있는 해결 방법만 답하고 나머지는 생략
+- 참고 내용에 무엇이 없거나 알 수 없다는 출처 한계 및 검수 설명은 삭제
 - 자연스러운 2~4문단, 보통 100~300자. 필요한 경우 이 범위보다 짧거나 길어도 됨
 - URL, 인사말, 마크다운, 과도한 홍보 문구를 포함하지 않음
 - 수정한 답변 텍스트만 출력

@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import { normalizeKinUrl, loadAnsweredUrls, appendAnsweredUrl, appendAnswerLog } from '../state';
 import * as fs from 'fs';
 import * as path from 'path';
-import { selectRelevantEvidence } from '../answer-writer';
+import { hasDisallowedMetaLanguage, selectRelevantEvidence } from '../answer-writer';
 import { buildDiscordFailure, buildDiscordRunSummary } from '../discord-notifier';
 
 let passed = 0;
@@ -207,6 +207,21 @@ test('failure notification does not expose webhook configuration', () => {
   const message = buildDiscordFailure('로그인 실패', '세션이 만료되었습니다.');
   assert.ok(message.includes('로그인 실패'));
   assert.ok(!message.includes('DISCORD_WEBHOOK_URL'));
+});
+console.log('\n[TEST 12] Disallowed source-meta language');
+test('blocks unnecessary statements about missing reference content', () => {
+  assert.ok(hasDisallowedMetaLanguage(
+    '참고 내용에는 실제 이용자의 예상치 못한 어려움이나 경험담은 확인되지 않습니다.'
+  ));
+  assert.ok(hasDisallowedMetaLanguage(
+    '이 글만으로는 정확한 처리 기간을 알 수 없습니다.'
+  ));
+});
+
+test('allows a direct answer without source-meta commentary', () => {
+  assert.ok(!hasDisallowedMetaLanguage(
+    '온라인 신청 후 주민센터에 방문해 지문 등록을 진행하면 됩니다.'
+  ));
 });
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n[TESTS] ${passed} passed, ${failed} failed`);
