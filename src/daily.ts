@@ -3,7 +3,12 @@ import * as path from 'path';
 import { config } from './config';
 import { fetchYesterdayArticles, fetchAllPublishedArticles, Article } from './wordpress';
 import { searchKin, readQuestion, checkKinSession } from './kin-search';
-import { generateVerifiedKinAnswer, selectRelevantEvidence, CodexUsageLimitError } from './answer-writer';
+import {
+  generateVerifiedKinAnswer,
+  selectRelevantEvidence,
+  CodexUsageLimitError,
+  CodexUnavailableError,
+} from './answer-writer';
 import { postAnswer } from './kin-editor';
 import { normalizeKinUrl, loadAnsweredUrls, isUrlAnswered, appendAnsweredUrl, appendAnswerLog } from './state';
 import { extractSearchQueries, matchArticleToQuestion } from './keyword-matcher';
@@ -34,6 +39,10 @@ const POST_SUCCESS_DELAYS_MIN = [42, 27, 72];
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isFatalCodexError(error: unknown): boolean {
+  return error instanceof CodexUsageLimitError || error instanceof CodexUnavailableError;
 }
 
 async function main() {
@@ -135,7 +144,7 @@ async function main() {
         queries = await extractSearchQueries(article, config.queriesPerArticle);
         console.log(`  키워드: ${queries.join(', ')}`);
       } catch (e) {
-        if (e instanceof CodexUsageLimitError) throw e;
+        if (isFatalCodexError(e)) throw e;
         console.error(`  키워드 도출 실패, 글 스킵:`, e);
         continue;
       }
@@ -211,7 +220,7 @@ async function main() {
             }
             console.log(`    매칭: ${matchType}${match.agreed ? '' : ' (판단 불일치, 보수적 채택)'} — ${match.reason}`);
           } catch (e) {
-            if (e instanceof CodexUsageLimitError) throw e;
+            if (isFatalCodexError(e)) throw e;
             console.error(`    매칭 판단 실패, 스킵: docId=${docId}`, e);
             continue;
           }
@@ -238,7 +247,7 @@ async function main() {
             answerText = verified.answerText;
             console.log(`    품질 검수 통과${verified.rewriteCount > 0 ? ` (재작성 ${verified.rewriteCount}회)` : ''}`);
           } catch (e) {
-            if (e instanceof CodexUsageLimitError) throw e;
+            if (isFatalCodexError(e)) throw e;
             console.error(`    답변 생성/검수 실패:`, e);
             continue;
           }
@@ -312,6 +321,14 @@ async function main() {
         'Codex 사용량 한도 도달',
         '현재 실행을 종료하고 다음 예약 실행에서 이어서 시도합니다.'
       ));
+    } else if (e instanceof CodexUnavailableError) {
+      stats.stoppedReason = `Codex 실행 불가: ${e.kind}`;
+      console.error(`\n[DAILY] Codex 실행 불가(${e.kind}) — 반복 스킵하지 않고 작업을 실패 처리합니다.`, e.message);
+      await notifyDiscord(buildDiscordFailure(
+        `Codex 실행 불가 (${e.kind})`,
+        e.message.slice(-1500)
+      ));
+      throw e;
     } else {
       throw e;
     }

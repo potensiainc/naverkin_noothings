@@ -212,7 +212,65 @@ export class CodexUsageLimitError extends Error {
   }
 }
 
-function runCodex(prompt: string): Promise<string> {
+export type CodexFailureKind =
+  | 'USAGE_LIMIT'
+  | 'UPGRADE_REQUIRED'
+  | 'AUTH_REQUIRED'
+  | 'NATIVE_CRASH'
+  | 'TRANSIENT_RUNTIME'
+  | 'NON_RETRYABLE';
+
+export class CodexUnavailableError extends Error {
+  constructor(message: string, public readonly kind: CodexFailureKind) {
+    super(message);
+    this.name = 'CodexUnavailableError';
+  }
+}
+
+export function classifyCodexFailure(code: number | null, output: string): CodexFailureKind {
+  if (/usage limit|rate limit exceeded|insufficient_quota/i.test(output)) return 'USAGE_LIMIT';
+  if (/requires a newer version of Codex|upgrade to the latest app or CLI/i.test(output)) {
+    return 'UPGRADE_REQUIRED';
+  }
+  if (/not logged in|authentication required|unauthorized|invalid[_ ]api[_ ]key/i.test(output)) {
+    return 'AUTH_REQUIRED';
+  }
+  // Windows STATUS_STACK_BUFFER_OVERRUN appears as either unsigned 3221226505
+  // or signed -1073740791 depending on how Node reports the native exit code.
+  if (code === 3221226505 || code === -1073740791 || /0xC0000409|BEX64/i.test(output)) {
+    return 'NATIVE_CRASH';
+  }
+  if (code !== 0 && /output file not created|cannot open the file|system cannot find|ECONNRESET|ETIMEDOUT|connection/i.test(output)) {
+    return 'TRANSIENT_RUNTIME';
+  }
+  return 'NON_RETRYABLE';
+}
+
+export function getCodexRetryDelayMs(attempt: number): number {
+  return [30_000, 90_000][Math.min(attempt, 1)];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function runCodex(prompt: string): Promise<string> {
+  const maxRetries = 2;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await runCodexOnce(prompt);
+    } catch (error) {
+      if (!(error instanceof CodexUnavailableError)) throw error;
+      const retryable = error.kind === 'NATIVE_CRASH' || error.kind === 'TRANSIENT_RUNTIME';
+      if (!retryable || attempt >= maxRetries) throw error;
+      const delayMs = getCodexRetryDelayMs(attempt);
+      console.error(`[CODEX] ${error.kind} — ${delayMs / 1000}초 후 재시도 ${attempt + 1}/${maxRetries}`);
+      await sleep(delayMs);
+    }
+  }
+}
+
+function runCodexOnce(prompt: string): Promise<string> {
   const tmpFile = path.join(os.tmpdir(), `codex-kin-${Date.now()}.txt`);
 
   return new Promise((resolve, reject) => {
@@ -234,8 +292,10 @@ function runCodex(prompt: string): Promise<string> {
 
     proc.on('close', (code: number | null) => {
       try {
-        if (/usage limit|rate limit exceeded|insufficient_quota/i.test(stdOutput + errOutput)) {
-          reject(new CodexUsageLimitError(`codex usage limit hit: ${(stdOutput + errOutput).slice(0, 300)}`));
+        const diagnostic = stdOutput + errOutput;
+        const failureKind = classifyCodexFailure(code, diagnostic);
+        if (failureKind === 'USAGE_LIMIT') {
+          reject(new CodexUsageLimitError(`codex usage limit hit: ${diagnostic.slice(-2000)}`));
           return;
         }
         if (fs.existsSync(tmpFile)) {
@@ -244,10 +304,16 @@ function runCodex(prompt: string): Promise<string> {
           if (answer) {
             resolve(answer);
           } else {
-            reject(new Error(`codex returned empty answer (exit ${code})`));
+            reject(new CodexUnavailableError(
+              `codex returned empty answer (exit ${code}): ${diagnostic.slice(-2000)}`,
+              failureKind
+            ));
           }
         } else {
-          reject(new Error(`codex output file not created (exit ${code}): ${errOutput.slice(0, 200)}`));
+          reject(new CodexUnavailableError(
+            `codex output file not created (exit ${code}): ${diagnostic.slice(-2000)}`,
+            failureKind
+          ));
         }
       } catch (e) {
         reject(e);
@@ -256,7 +322,7 @@ function runCodex(prompt: string): Promise<string> {
 
     proc.on('error', (e) => {
       fs.existsSync(tmpFile) && fs.unlinkSync(tmpFile);
-      reject(e);
+      reject(new CodexUnavailableError(`codex process failed to start: ${e.message}`, 'TRANSIENT_RUNTIME'));
     });
   });
 }

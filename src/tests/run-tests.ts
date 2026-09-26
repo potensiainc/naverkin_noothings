@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import { normalizeKinUrl, loadAnsweredUrls, appendAnsweredUrl, appendAnswerLog } from '../state';
 import * as fs from 'fs';
 import * as path from 'path';
-import { hasDisallowedMetaLanguage, selectRelevantEvidence } from '../answer-writer';
+import { classifyCodexFailure, getCodexRetryDelayMs, hasDisallowedMetaLanguage, selectRelevantEvidence } from '../answer-writer';
 import { buildDiscordFailure, buildDiscordRunSummary } from '../discord-notifier';
 
 let passed = 0;
@@ -222,6 +222,35 @@ test('allows a direct answer without source-meta commentary', () => {
   assert.ok(!hasDisallowedMetaLanguage(
     '온라인 신청 후 주민센터에 방문해 지문 등록을 진행하면 됩니다.'
   ));
+});
+console.log('\n[TEST 13] Codex native crash recovery');
+test('classifies Windows stack-buffer-overrun exit as a native crash', () => {
+  assert.strictEqual(classifyCodexFailure(3221226505, ''), 'NATIVE_CRASH');
+});
+
+test('classifies a nonzero missing-output runtime failure as retryable', () => {
+  assert.strictEqual(
+    classifyCodexFailure(1, 'codex output file not created: The system cannot open the file.'),
+    'TRANSIENT_RUNTIME'
+  );
+});
+
+test('does not retry a usage-limit response as a native crash', () => {
+  assert.strictEqual(classifyCodexFailure(1, 'usage limit reached'), 'USAGE_LIMIT');
+});
+
+test('classifies an outdated CLI as a fatal upgrade requirement', () => {
+  assert.strictEqual(
+    classifyCodexFailure(1, "The 'gpt-6-astra' model requires a newer version of Codex."),
+    'UPGRADE_REQUIRED'
+  );
+});
+
+test('uses bounded backoff delays for two in-process retries', () => {
+  assert.deepStrictEqual(
+    [getCodexRetryDelayMs(0), getCodexRetryDelayMs(1)],
+    [30_000, 90_000]
+  );
 });
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n[TESTS] ${passed} passed, ${failed} failed`);
