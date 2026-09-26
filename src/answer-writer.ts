@@ -250,6 +250,16 @@ export function getCodexRetryDelayMs(attempt: number): number {
   return [30_000, 90_000][Math.min(attempt, 1)];
 }
 
+export function codexFailureExitCode(kind: CodexFailureKind): number {
+  switch (kind) {
+    case 'UPGRADE_REQUIRED': return 31;
+    case 'AUTH_REQUIRED': return 32;
+    case 'NATIVE_CRASH':
+    case 'TRANSIENT_RUNTIME': return 33;
+    default: return 34;
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

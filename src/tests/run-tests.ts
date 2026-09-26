@@ -2,7 +2,13 @@ import * as assert from 'assert';
 import { normalizeKinUrl, loadAnsweredUrls, appendAnsweredUrl, appendAnswerLog } from '../state';
 import * as fs from 'fs';
 import * as path from 'path';
-import { classifyCodexFailure, getCodexRetryDelayMs, hasDisallowedMetaLanguage, selectRelevantEvidence } from '../answer-writer';
+import {
+  classifyCodexFailure,
+  codexFailureExitCode,
+  getCodexRetryDelayMs,
+  hasDisallowedMetaLanguage,
+  selectRelevantEvidence,
+} from '../answer-writer';
 import { buildDiscordFailure, buildDiscordRunSummary } from '../discord-notifier';
 
 let passed = 0;
@@ -251,6 +257,14 @@ test('uses bounded backoff delays for two in-process retries', () => {
     [getCodexRetryDelayMs(0), getCodexRetryDelayMs(1)],
     [30_000, 90_000]
   );
+});
+
+test('maps Codex failures to watchdog exit codes', () => {
+  assert.strictEqual(codexFailureExitCode('UPGRADE_REQUIRED'), 31);
+  assert.strictEqual(codexFailureExitCode('AUTH_REQUIRED'), 32);
+  assert.strictEqual(codexFailureExitCode('NATIVE_CRASH'), 33);
+  assert.strictEqual(codexFailureExitCode('TRANSIENT_RUNTIME'), 33);
+  assert.strictEqual(codexFailureExitCode('NON_RETRYABLE'), 34);
 });
 // ── Summary ───────────────────────────────────────────────────────────────
 console.log(`\n[TESTS] ${passed} passed, ${failed} failed`);

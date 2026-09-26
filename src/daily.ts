@@ -8,6 +8,7 @@ import {
   selectRelevantEvidence,
   CodexUsageLimitError,
   CodexUnavailableError,
+  codexFailureExitCode,
 } from './answer-writer';
 import { postAnswer } from './kin-editor';
 import { normalizeKinUrl, loadAnsweredUrls, isUrlAnswered, appendAnsweredUrl, appendAnswerLog } from './state';
@@ -355,5 +356,7 @@ function errorText(error: unknown): string {
 main().catch(async e => {
   console.error('[DAILY] Fatal:', e);
   await notifyDiscord(buildDiscordFailure('치명적 실행 오류', errorText(e)));
-  process.exitCode = 1;
+  process.exitCode = e instanceof CodexUnavailableError
+    ? codexFailureExitCode(e.kind)
+    : 1;
 });

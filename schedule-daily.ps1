@@ -22,8 +22,8 @@ if (-not $isAdmin) {
 $taskName = "nothingz-kin-daily"
 $projectDir = "D:\naverkin_noothings"
 $action = New-ScheduledTaskAction `
-  -Execute "cmd.exe" `
-  -Argument "/c npm run daily >> `"$projectDir\state\daily.log`" 2>&1" `
+  -Execute "powershell.exe" `
+  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$projectDir\run-daily-watchdog.ps1`"" `
   -WorkingDirectory $projectDir
 
 # 매일 12:00, 17:00, 21:00 실행
